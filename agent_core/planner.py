@@ -65,14 +65,17 @@ DIRECTION_AZ = {"N": 0.0, "NE": 45.0, "E": 90.0, "SE": 135.0, "S": 180.0,
 FAULT_BASE = (0.80, 2)             # no false report since the last correct one
 FAULT_AFTER_FALSE = (0.70, 3)      # after a false report, still inside the free allowance
 FAULT_AFTER_ALLOWANCE = (0.60, 3)  # the next false report would cost points
-FAULT_STRONG = 0.70                # at or below this on every counted night: report without asking
+FAULT_STRONG = 0.70                # counted nights averaging at or below this: report without asking
 FAULT_MIN_SAMPLES = 8              # a night with fewer clean samples is not judged
 FAULT_REF_NIGHTS = 5
 FAULT_DARK_CHECKS_WANTED = 6       # force DARK on a suspicious night until this many DARK band checks exist
 FAULT_SKY_CHECKS_MIN = 6           # fewer band checks than this give no sky estimate for the night
 FAULT_SKY_GRID = [0.5 + 0.025 * k for k in range(41)]   # candidate sky levels, relative to the quiet reference
 FAULT_SKY_OK = 0.9                 # logged as sky_ok when the night's sky estimate is at least this
-FAULT_RECOVERY_RANGE = (0.6, 1.0)  # per-night factor by which an earthquake's efficiency loss shrinks
+# Per-night factor by which an earthquake's efficiency loss shrinks. It is fitted from the
+# agent's own nights but may not exceed the upper bound: a sequence that "recovers" more
+# slowly than that is not recovering, it has a fault sitting on top of the earthquake.
+FAULT_RECOVERY_RANGE = (0.6, 0.90)
 FAULT_MAX_FORCED_PER_NIGHT = 4
 FAULT_MAX_LLM_WAITS = 2
 
@@ -148,9 +151,12 @@ CLASSES = ("QSO", "ELG", "LRG", "BGS", "Star")
 OUTLOOKS = ("good", "degraded", "closed")
 EXPOSURE_BIAS_RANGE = (0.9, 1.1)
 # Skip the nightly call when it could not finish anyway, or when the wall clock is
-# getting short enough that the deterministic search should keep all of it.
+# getting short enough that the deterministic search should keep all of it. Both wall-clock
+# figures are fractions of the card's own limit (400 s and 340 s on a 900 s card), so a
+# card with a shorter limit still gets its share of model calls.
 ADVICE_MIN_LLM_BUDGET_SECONDS = 30.0
-ADVICE_MIN_WALLCLOCK_SECONDS = 400.0
+ADVICE_MIN_WALLCLOCK_FRACTION = 400.0 / 900.0
+LLM_BUDGET_FRACTION = 340.0 / 900.0
 
 ADVICE_SYSTEM_PROMPT = (
     "You advise a robotic multi-fibre telescope survey once at the start of each night. "
@@ -188,6 +194,9 @@ class Planner:
         self.log = log
         self.grid = state.fiber_grid
         self.llm = LLMClient(log=log)
+        self.llm.total_budget_seconds = min(self.llm.total_budget_seconds,
+                                            LLM_BUDGET_FRACTION * state.wallclock_limit)
+        log(f"planner: wall-clock limit {state.wallclock_limit:.0f}s, llm budget {self.llm.total_budget_seconds:.0f}s")
         self.trace = TraceLog(log=log)
         self.tape = AdviceTape(log=log)
 
@@ -202,9 +211,8 @@ class Planner:
         # Earthquake sequence: efficiency is modelled as quiet * (1 - loss), the loss shrinking
         # by a constant factor per night; all of it estimated from the agent's own nights.
         self._quake_quiet: float | None = None       # quiet reference frozen when the sequence began
-        self._quake_anchor: tuple | None = None      # (night index, loss) of the last judged non-low night
-        self._quake_first: tuple | None = None       # (night index, loss) of the first judged night
-        self._quake_recovery = 1.0
+        self._quake_first: tuple | None = None       # (night index, loss) the recovery curve starts from
+        self._quake_recovery = FAULT_RECOVERY_RANGE[1]
         self._night_kinds: dict[str, set] = {}       # night_id -> notice kinds seen in its bulletins
         self._quake_onset: dict[str, float] = {}     # night_id -> survey hours of its first earthquake bulletin
         self._report_due: str | None = None
@@ -401,7 +409,7 @@ class Planner:
             status = "replay"
         elif self.llm.disabled:
             advice, status = self._sanitize_advice(None), "disabled"
-        elif self.llm.budget_left_seconds() < ADVICE_MIN_LLM_BUDGET_SECONDS or left < ADVICE_MIN_WALLCLOCK_SECONDS:
+        elif self.llm.budget_left_seconds() < ADVICE_MIN_LLM_BUDGET_SECONDS or left < ADVICE_MIN_WALLCLOCK_FRACTION * state.wallclock_limit:
             advice, status = self._sanitize_advice(None), "skipped"
         else:
             advice = self._sanitize_advice(self.llm.ask_json(ADVICE_SYSTEM_PROMPT, user_payload, left))
@@ -511,10 +519,12 @@ class Planner:
         tonight cannot be judged (no reference yet, or the first night of a sequence)."""
         if not quake:
             return quiet
-        if self._quake_quiet is None or self._quake_anchor is None:
+        if self._quake_quiet is None or self._quake_first is None:
             return None
-        anchor_night, loss = self._quake_anchor
-        loss = max(0.0, loss) * self._quake_recovery ** max(0, night_index - anchor_night)
+        # Always measured from the start of the curve, never re-anchored on last night: a
+        # fault that arrives during the sequence must not be absorbed one night at a time.
+        first_night, loss = self._quake_first
+        loss = max(0.0, loss) * self._quake_recovery ** max(0, night_index - first_night)
         return self._quake_quiet * (1.0 - loss)
 
     @staticmethod
@@ -535,11 +545,12 @@ class Planner:
     @staticmethod
     def _fault_tier(run: list, mode: tuple) -> str:
         """"none" (not enough low nights), "strong" (report by rule) or "mid" (borderline:
-        only in the base mode, and only when some counted night is above FAULT_STRONG)."""
+        only in the base mode, and only when the counted nights AVERAGE above FAULT_STRONG --
+        one deep night next to one just over the line is a fault, not a borderline case)."""
         threshold, needed = mode
         if len(run) < needed:
             return "none"
-        if mode == FAULT_BASE and any(ratio > FAULT_STRONG for ratio in run[:needed]):
+        if mode == FAULT_BASE and sum(run[:needed]) / needed > FAULT_STRONG:
             return "mid"
         return "strong"
 
@@ -576,7 +587,7 @@ class Planner:
             self.state.forget_quality_history()   # the instrument is repaired: learn the level again
             self.fault_nights = []
             self._fault_floor = 0
-            self._quake_anchor = None             # re-anchor the recovery curve on the next judged night
+            self._quake_first = None              # restart the recovery curve on the next judged night
             return
         self.false_reports += 1
         # The low level was real and not a fault: accept it as the new normal.
@@ -589,7 +600,7 @@ class Planner:
                 counted += 1
         last = self.fault_nights[-1] if self.fault_nights else None
         if last and last["quake"] and last["level"] is not None and self._quake_quiet:
-            self._quake_anchor = (last["index"], 1.0 - last["level"] / self._quake_quiet)
+            self._quake_first = (last["index"], 1.0 - last["level"] / self._quake_quiet)
         self._fault_floor = len(self.fault_nights)
 
     def _close_fault_night(self, night_index: int, payload: dict) -> None:
@@ -604,10 +615,10 @@ class Planner:
 
         if quake and self._quake_quiet is None:
             self._quake_quiet = quiet                  # sequence begins: freeze the quiet reference
-            self._quake_anchor = self._quake_first = None
-            self._quake_recovery = 1.0
+            self._quake_first = None
+            self._quake_recovery = FAULT_RECOVERY_RANGE[1]
         elif not quake:
-            self._quake_quiet = self._quake_anchor = self._quake_first = None
+            self._quake_quiet = self._quake_first = None
         first_of_sequence = quake and self._quake_first is None
         since = self._quake_onset.pop(night_id, None) if first_of_sequence else None
         ratios = state.night_ratios(night_index, since)
@@ -634,7 +645,6 @@ class Planner:
             elif night_index > self._quake_first[0] and self._quake_first[1] > 0.05 and loss > 0.0:
                 factor = (loss / self._quake_first[1]) ** (1.0 / (night_index - self._quake_first[0]))
                 self._quake_recovery = min(FAULT_RECOVERY_RANGE[1], max(FAULT_RECOVERY_RANGE[0], factor))
-            self._quake_anchor = (night_index, loss)
         self.fault_nights.append(record)
 
         mode = self._fault_mode()
@@ -1049,7 +1059,9 @@ if __name__ == "__main__":
     streak, tier = Planner._fault_streak, Planner._fault_tier
     # two low nights -> strong when both are deep, mid when one is borderline
     assert tier(streak([night(1.0), night(0.65), night(0.6)], 0.8), FAULT_BASE) == "strong"
-    assert tier(streak([night(1.0), night(0.75), night(0.6)], 0.8), FAULT_BASE) == "mid"
+    assert tier(streak([night(1.0), night(0.78), night(0.7)], 0.8), FAULT_BASE) == "mid"
+    # one deep night next to one just over the line averages below it: a fault, not borderline
+    assert tier(streak([night(1.0), night(0.49), night(0.71)], 0.8), FAULT_BASE) == "strong"
     # one low night, or a recovery in between, is not enough
     assert tier(streak([night(0.6), night(1.0), night(0.6)], 0.8), FAULT_BASE) == "none"
     # unjudged nights neither extend nor break the run

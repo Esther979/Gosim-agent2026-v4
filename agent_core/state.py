@@ -64,6 +64,7 @@ class SurveyState:
         self.max_consecutive_reports = int(reporting.get("max_consecutive_reports", limits.get("max_consecutive_reports", 32)))
         self.false_report_free_allowance = int(reporting.get("false_report_free_allowance", 0))
         self.response_max_bytes = int(limits.get("response_max_bytes", 524288))
+        self.wallclock_limit = float(limits.get("global_wallclock_seconds", 900) or 900)
 
         # Parallel arrays, one slot per target, in catalogue order.
         self.ids: list[str] = []

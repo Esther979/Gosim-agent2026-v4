@@ -3,9 +3,14 @@
   "protocol": "jsonl-v4",
   "image": "python:3.12-slim",
   "build": [],
-  "run": ["python3", "-u", "agent.py"],
+  "run": [
+    "python3",
+    "-u",
+    "agent.py"
+  ],
   "working_directory": ".",
   "environment": {
-    "PYTHONDONTWRITEBYTECODE": "1"
+    "PYTHONDONTWRITEBYTECODE": "1",
+    "LLM_USER_AGENT": "Gosim-agent2026-v4/0.1 (GOSIM Agentic Observer hackathon agent; Python urllib)"
   }
 }
