@@ -48,10 +48,12 @@ from .state import PendingPrediction
 REQUIRED_BONUS = 60.0
 DONE_FACTOR = 0.95
 PLAN_FACTOR_SAFETY = 0.9
-EDGE_MARGIN_DEG = 0.08
+EDGE_MARGIN_FRACTION = 0.08 / 0.6325   # keep-clear band at a fibre's edge, as a fraction of its width
 DURATIONS = (300, 450, 600, 900, 1200, 1500, 1800, 2400, 3000, 3600)
 MIN_VISIBLE_SECONDS = 600
-NEIGHBOUR_RADIUS_DEG = 2.1
+NEIGHBOUR_RADIUS_FRACTION = 0.83      # of the field side: far enough to fill a field centred on any fibre
+MAX_CENTRE_FIBRES = 25                # fibres tried as the pointing centre per anchor
+FAST_CENTRE_FIBRES = 4
 ANCHORS = 6
 ANCHOR_POOL = 300
 CLOSED_KINDS = {"rain", "storm"}
@@ -167,6 +169,16 @@ EXPOSURE_BIAS_RANGE = (0.9, 1.1)
 # needs well under 100 s, so 500 s of model time fits even if waiting on the model is
 # charged against the limit.
 ADVICE_MIN_LLM_BUDGET_SECONDS = 30.0
+PACE_PROBE = 40                     # planned decisions run at full depth before the pace is set
+# A survey can have far more nights than the budget has calls (a year-long card would spend
+# everything in the first two months). On such a card the nightly call is made only on
+# nights that have something to decide -- a forecast or bulletin notice, or an open
+# request -- and never faster than the budget lasts: at night n of N at most the share
+# n/N of the advice budget (plus a little slack) may be spent. The rest is kept for fault
+# arbitration.
+ADVICE_SECONDS_PER_CALL = 9.0
+ADVICE_BUDGET_SHARE = 0.85
+ADVICE_PACING_SLACK_SECONDS = 45.0
 ADVICE_MIN_WALLCLOCK_FRACTION = 250.0 / 900.0
 LLM_BUDGET_FRACTION = 500.0 / 900.0
 
@@ -205,10 +217,24 @@ class Planner:
         self.state = state
         self.log = log
         self.grid = state.fiber_grid
+        # Everything about the fibre layout is derived from the instrument the card
+        # describes (3x3 wide fibres up to 10x10 small ones), nothing is hard-coded.
+        self.edge_margin = EDGE_MARGIN_FRACTION * self.grid.glass
+        self.neighbour_radius = NEIGHBOUR_RADIUS_FRACTION * self.grid.fov
+        by_centrality = sorted(range(self.grid.n), key=lambda f: (sum(c * c for c in self.grid.fiber_center(f)), f))
+        self.fast_fibres = tuple(sorted(by_centrality[:FAST_CENTRE_FIBRES]))
+        step = max(1, -(-self.grid.side // 5))   # ceil(side / 5): every fibre up to 5x5, a spread sample beyond
+        sample = [f for f in range(self.grid.n)
+                  if (f // self.grid.side) % step == 0 and (f % self.grid.side) % step == 0]
+        self.centre_fibres = tuple(sample if len(sample) <= MAX_CENTRE_FIBRES else by_centrality[:MAX_CENTRE_FIBRES])
         self.llm = LLMClient(log=log)
         self.llm.total_budget_seconds = min(self.llm.total_budget_seconds,
                                             LLM_BUDGET_FRACTION * state.wallclock_limit)
-        log(f"planner: wall-clock limit {state.wallclock_limit:.0f}s, llm budget {self.llm.total_budget_seconds:.0f}s")
+        self.advice_budget = ADVICE_BUDGET_SHARE * self.llm.total_budget_seconds
+        self.advice_sparse = len(state.nights) * ADVICE_SECONDS_PER_CALL > self.advice_budget
+        log(f"planner: wall-clock limit {state.wallclock_limit:.0f}s, llm budget {self.llm.total_budget_seconds:.0f}s, "
+            f"advice {'only on eventful nights, paced' if self.advice_sparse else 'every night'}; "
+            f"fibres {self.grid.side}x{self.grid.side}, centres tried {len(self.centre_fibres)}")
         self.trace = TraceLog(log=log)
         self.tape = AdviceTape(log=log)
 
@@ -241,6 +267,15 @@ class Planner:
         self._request_thresholds_now: dict = {}
         self.pursue_requests = True
         self._active_requests: list = []
+        self._pace_cost: dict = {0: None, 1: None, 2: None}   # measured seconds per planned decision, per level
+        self._pace_samples: dict = {0: [], 1: [], 2: []}
+        self._pace_prev: tuple | None = None
+        self._pace_planned = 0
+        self._pace_night_total: float | None = None
+        self._llm_charged = True                      # until a model call shows the engine does not charge for it
+        self._last_forced: tuple | None = None        # (request_id, target index) of the previous action, if forced
+        self._request_hold_until = float("-inf")      # survey hours: no forced exposure before this
+        self._hours_now = 0.0
         self._request_tries: dict = {}                # (request_id, target index) -> forced exposures so far
         self._request_status: dict = {}               # request_id -> last logged "pursue"/"drop"
         self._forced_request: tuple | None = None     # (target index, threshold, seconds to deadline, request_id)
@@ -277,6 +312,18 @@ class Planner:
         self._pace(payload, now)
         self._current_action_index = payload.get("observe_action_index")
         self._active_requests = payload.get("active_requests") or []
+        self._hours_now = hours
+        if self._last_forced is not None:
+            request_id, forced_index = self._last_forced
+            self._last_forced = None
+            if last_result and last_result.get("action") == "observe":
+                score = next((float(h.get("score", 0.0)) for h in last_result.get("hits", [])
+                              if h.get("target_id") == state.ids[forced_index]), None)
+                if score is not None and score <= 0.0:
+                    # the sky was shut, not the target's fault: give the try back and hold off a while
+                    key = (request_id, forced_index)
+                    self._request_tries[key] = max(0, self._request_tries.get(key, 1) - 1)
+                    self._request_hold_until = hours + 0.5
         self._request_thresholds_now = self._request_thresholds(payload.get("active_requests") or [])
 
         night = state.current_night(now)
@@ -307,6 +354,7 @@ class Planner:
                     "reason": "bulletin: rain/storm over the whole sky"}
 
         self._force_dark_if_suspicious(night_index)
+        self._pace_prev = self._pace_prev[:2] + (True,) + self._pace_prev[3:]
         action = self.plan(now, night_end, night_index, hours)
         if action is not None and state.force_program:
             self._forced_tonight += 1
@@ -335,16 +383,49 @@ class Planner:
         return int(max(60, min(3600, slot - into if into else slot)))
 
     def _pace(self, payload: dict, now) -> None:
-        """Do less work per decision when the wall clock is short for the nights still to come."""
+        """Choose how much search to do per decision (0 = full, 1 = one anchor, 2 = one
+        anchor and only the central fibres) from what decisions have actually cost so far.
+        The cost is read off the engine's own clock (`wallclock.elapsed_seconds`), so it is
+        in whatever units the limit is charged in; the first PACE_PROBE planned decisions
+        run at full depth to measure it. Time spent waiting on the model is set aside only
+        if the engine turns out to charge for it."""
         state = self.state
-        remaining_wall = float((payload.get("wallclock") or {}).get("remaining_seconds", 1e9))
+        clock = payload.get("wallclock") or {}
+        remaining = float(clock.get("remaining_seconds", 1e9))
+        elapsed = float(clock.get("elapsed_seconds", 0.0))
+        previous = self._pace_prev      # (elapsed, level, went through plan(), model seconds mark)
+        if previous is not None:
+            delta = max(0.0, elapsed - previous[0])
+            model_seconds = self.llm.spent_seconds - previous[3]
+            if model_seconds > 2.0:
+                self._llm_charged = delta > 0.5 * model_seconds
+            elif previous[2]:
+                # median of everything seen at this level so far: one slow decision (start-up,
+                # a night boundary) must not set the pace
+                samples = self._pace_samples[previous[1]]
+                samples.append(delta)
+                if len(samples) > 400:
+                    del samples[:200]
+                self._pace_cost[previous[1]] = _median(samples)
+                self._pace_planned += 1
         night_seconds = sum(max(0.0, (end - max(start, now)).total_seconds()) for start, end in state.nights if end > now)
-        decisions_left = max(1.0, night_seconds / 700.0)
-        per_decision = remaining_wall / decisions_left
-        level = 0 if per_decision > 0.12 else 1 if per_decision > 0.04 else 2
+        if self._pace_night_total is None:
+            self._pace_night_total = night_seconds
+        per_decision_sim = 700.0 if self._pace_planned < PACE_PROBE else \
+            max(200.0, (self._pace_night_total - night_seconds) / self._pace_planned)
+        decisions_left = max(1.0, night_seconds / per_decision_sim)
+        reserve = 60.0 + (self.llm.budget_left_seconds() if self._llm_charged and not self.llm.disabled else 0.0)
+        usable = max(0.0, remaining - reserve) * 0.85
+        full = self._pace_cost[0]
+        level = 0
+        if self._pace_planned >= PACE_PROBE and full is not None:
+            costs = (full, self._pace_cost[1] or full / 4.0, self._pace_cost[2] or full / 8.0)
+            level = next((lv for lv in (0, 1, 2) if costs[lv] * decisions_left <= usable), 2)
         if level != state.fast_level:
-            self.log(f"planner: pace level {level} ({per_decision * 1000:.0f} ms per decision left)")
+            self.log(f"planner: pace level {level} ({(full or 0) * 1000:.0f} ms per full decision, "
+                     f"{decisions_left:.0f} decisions left, {usable:.0f}s usable)")
             state.fast_level = level
+        self._pace_prev = (elapsed, level, False, self.llm.spent_seconds)
 
     # -- LLM: one bounded call per night ------------------------------------------
 
@@ -429,6 +510,11 @@ class Planner:
             advice, status = self._sanitize_advice(None), "disabled"
         elif self.llm.budget_left_seconds() < ADVICE_MIN_LLM_BUDGET_SECONDS or left < ADVICE_MIN_WALLCLOCK_FRACTION * state.wallclock_limit:
             advice, status = self._sanitize_advice(None), "skipped"
+        elif self.advice_sparse and not (forecast_tonight or bulletin_notices or requests):
+            advice, status = self._sanitize_advice(None), "quiet"       # nothing to decide tonight
+        elif self.advice_sparse and self.llm.spent_seconds > ADVICE_PACING_SLACK_SECONDS + \
+                self.advice_budget * (night_index + 1) / max(1, len(state.nights)):
+            advice, status = self._sanitize_advice(None), "paced"       # ahead of the budget's pace
         else:
             advice = self._sanitize_advice(self.llm.ask_json(ADVICE_SYSTEM_PROMPT, user_payload, left))
             status = "ok" if advice["ok"] else "fell back"
@@ -438,8 +524,9 @@ class Planner:
 
         state.duration_scale = advice["exposure_bias"]
         self.pursue_requests = advice["pursue_requests"]
-        self.log(f"planner: night {night_date} llm advice {status} bias={advice['exposure_bias']:.2f} "
-                 f"pursue={advice['pursue_requests']} outlook={advice['sky_outlook']}")
+        if status not in ("quiet", "paced") or not self.advice_sparse:   # a year of "quiet" lines would drown the log
+            self.log(f"planner: night {night_date} llm advice {status} bias={advice['exposure_bias']:.2f} "
+                     f"pursue={advice['pursue_requests']} outlook={advice['sky_outlook']}")
         self.trace.write({"event": "night_advice", "night_date": night_date, "status": status,
                           "exposure_bias": advice["exposure_bias"], "pursue_requests": advice["pursue_requests"],
                           "sky_outlook": advice["sky_outlook"], "notes": advice["notes"]})
@@ -959,7 +1046,7 @@ class Planner:
 
         anchors: list[tuple[float, int]] = []
         request = self._pick_request_target(now, lst, moon, seconds_left, night_index) \
-            if allow_request and state.fast_level == 0 else None
+            if allow_request and self._hours_now >= self._request_hold_until else None
         forced = request[1] if request is not None else None
         if forced is not None:
             anchors = [(1.0, forced)]
@@ -975,7 +1062,7 @@ class Planner:
         anchors.sort(key=lambda t: -t[0])
 
         n_anchors = 1 if state.fast_level >= 1 else ANCHORS
-        fibers = range(self.grid.n) if state.fast_level < 2 else (5, 6, 9, 10)
+        fibers = self.centre_fibres if state.fast_level < 2 else self.fast_fibres
         best = None  # (total, c_alt, c_az, chosen)
         tried = 0
         for _, anchor in anchors:
@@ -985,7 +1072,7 @@ class Planner:
                 break
             tried += 1
             a_alt, a_az = altaz(anchor)
-            near = [j for j in state.neighbours(state.ra[anchor], state.dec[anchor], NEIGHBOUR_RADIUS_DEG) if j in visible]
+            near = [j for j in state.neighbours(state.ra[anchor], state.dec[anchor], self.neighbour_radius) if j in visible]
             near_values = {j: achievable(j) for j in near}
             for fiber in fibers:
                 d_north, d_east = self.grid.fiber_center(fiber)
@@ -1005,7 +1092,7 @@ class Planner:
                     fib, margin = self.grid.classify(*offsets)
                     if fib is None:
                         continue
-                    score = v * (1.0 if margin >= EDGE_MARGIN_DEG * (1 + 1.5 * state.misses[j]) else 0.4)
+                    score = v * (1.0 if margin >= self.edge_margin * (1 + 1.5 * state.misses[j]) else 0.4)
                     existing = chosen.get(fib)
                     if existing is None or score > existing[0]:
                         chosen[fib] = (score, j, margin)
@@ -1014,7 +1101,7 @@ class Planner:
                     # would have scored higher in that cell
                     offsets = tangent_offsets(a_alt, a_az, c_alt, c_az)
                     fib, margin = self.grid.classify(*offsets) if offsets is not None else (None, 0.0)
-                    if fib is None or margin < EDGE_MARGIN_DEG:
+                    if fib is None or margin < self.edge_margin:
                         continue
                     chosen[fib] = (0.0, forced, margin)
                 if not chosen:
@@ -1033,6 +1120,7 @@ class Planner:
                 return self.plan(now, night_end, night_index, hours, allow_request=False)
             key = (request[4], forced)
             self._request_tries[key] = self._request_tries.get(key, 0) + 1
+            self._last_forced = key
             self.request_exposures += 1
         return action
 
