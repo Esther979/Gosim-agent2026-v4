@@ -59,10 +59,67 @@ BLOCKING_KINDS = {"terrain_obstruction", "rocket_launch"}
 DIRECTION_AZ = {"N": 0.0, "NE": 45.0, "E": 90.0, "SE": 135.0, "S": 180.0,
                 "SW": 225.0, "W": 270.0, "NW": 315.0}
 
-REPORT_DROP = 0.62
-REPORT_CONFIRMATIONS = 3
-REPORT_SPACING_HOURS = 6.0
-MAX_REPORTS = 2
+# Instrument-fault detector (see "instrument fault reporting" below). Each entry is
+# (a night counts as low when its median ratio is <= this fraction of the reference,
+#  consecutive low nights needed before reporting).
+FAULT_BASE = (0.80, 2)             # no false report since the last correct one
+FAULT_AFTER_FALSE = (0.70, 3)      # after a false report, still inside the free allowance
+FAULT_AFTER_ALLOWANCE = (0.60, 3)  # the next false report would cost points
+FAULT_STRONG = 0.70                # at or below this on every counted night: report without asking
+FAULT_MIN_SAMPLES = 8              # a night with fewer clean samples is not judged
+FAULT_REF_NIGHTS = 5
+FAULT_DARK_CHECKS_WANTED = 6       # force DARK on a suspicious night until this many DARK band checks exist
+FAULT_SKY_CHECKS_MIN = 6           # fewer band checks than this give no sky estimate for the night
+FAULT_SKY_GRID = [0.5 + 0.025 * k for k in range(41)]   # candidate sky levels, relative to the quiet reference
+FAULT_SKY_OK = 0.9                 # logged as sky_ok when the night's sky estimate is at least this
+FAULT_RECOVERY_RANGE = (0.6, 1.0)  # per-night factor by which an earthquake's efficiency loss shrinks
+FAULT_MAX_FORCED_PER_NIGHT = 4
+FAULT_MAX_LLM_WAITS = 2
+
+FAULT_SYSTEM_PROMPT = (
+    "You arbitrate a borderline instrument-fault alarm for a robotic telescope survey. "
+    "For each recent night you get: ratio = that night's measured efficiency relative to "
+    "what a healthy instrument should deliver (already corrected for the measured sky "
+    "level and, during an earthquake sequence, for the expected night-by-night recovery); "
+    "c = number of samples; sky = measured sky level (1.0 normal); quake = an earthquake "
+    "notice was active; notice_kinds = public weather/event notices that night; "
+    "profile = the night in two-hour blocks as [hours after night start, ratio, samples]. "
+    "The last nights have ratio between 0.70 and 0.80: too low to ignore, too high to be "
+    "sure. Decide between reporting a fault now and waiting one more night.\n"
+    "How the candidates look: an INSTRUMENT FAULT is one abrupt step at a single moment "
+    "(inside a night's profile: normal blocks, then low blocks) and afterwards the ratio "
+    "stays flat at the same reduced level, block after block and night after night, with "
+    "no notice explaining it. WEATHER the sky estimate missed wanders between blocks and "
+    "nights, tends to come with overcast/haze/rain/cold_snap notices on or next to those "
+    "nights, and passes within a night or two. A SECOND EARTHQUAKE inside a quake "
+    "sequence drops the ratio and then lets it climb back night after night.\n"
+    "Costs: a correct report repairs the fault at once. A false report uses up a limited "
+    "free allowance and makes the rule stricter afterwards, which delays catching a real "
+    "fault later. Waiting one night while a fault of this size is real costs only about "
+    "a quarter of one night. If the picture is not clearly a fault, wait.\n"
+    'Reply with exactly one JSON object and nothing else: {"verdict": "report" | '
+    '"wait_one_night", "why": "<=100 chars"}. Answer quickly.'
+)
+
+def _median(values: list) -> float:
+    ordered = sorted(values)
+    return ordered[len(ordered) // 2]
+
+
+def _censored_median(samples: list) -> float:
+    """Median of (value, is_lower_bound) samples by the Kaplan-Meier product-limit
+    estimate: a lower bound stays "at risk" up to its value and is then withdrawn without
+    counting as an observation. If the estimate never falls to one half (too many lower
+    bounds at the top), the largest value is returned -- the median is at least that."""
+    ordered = sorted(samples, key=lambda s: (s[0], s[1]))
+    surviving, at_risk = 1.0, len(ordered)
+    for value, bound in ordered:
+        if not bound:
+            surviving *= 1.0 - 1.0 / at_risk
+            if surviving <= 0.5:
+                return value
+        at_risk -= 1
+    return ordered[-1][0]
 
 # Time-limited observation requests (participant guide section 8 / appendix B). There is
 # no penalty for letting one expire -- `observation_requests.miss_penalty` is fixed at 0 --
@@ -136,8 +193,25 @@ class Planner:
 
         self.observe_count = 0
         self.reports = 0
-        self.last_report_hours = float("-inf")
-        self.suspicion_hours: list[float] = []
+        self.correct_reports = 0
+        self.false_reports = 0                       # since the last correct report
+        self.fault_nights: list[dict] = []           # one record per closed night
+        self._fault_floor = 0                        # records before this index no longer count towards a streak
+        self._fault_open_night: int | None = None
+        self._quiet_fallback: float | None = None    # quiet reference carried across a correct report
+        # Earthquake sequence: efficiency is modelled as quiet * (1 - loss), the loss shrinking
+        # by a constant factor per night; all of it estimated from the agent's own nights.
+        self._quake_quiet: float | None = None       # quiet reference frozen when the sequence began
+        self._quake_anchor: tuple | None = None      # (night index, loss) of the last judged non-low night
+        self._quake_first: tuple | None = None       # (night index, loss) of the first judged night
+        self._quake_recovery = 1.0
+        self._night_kinds: dict[str, set] = {}       # night_id -> notice kinds seen in its bulletins
+        self._quake_onset: dict[str, float] = {}     # night_id -> survey hours of its first earthquake bulletin
+        self._report_due: str | None = None
+        self._report_streak = 0
+        self._awaiting_report_result = False
+        self._llm_waits = 0
+        self._forced_tonight = 0
         self.night_index_seen: int | None = None
         self.consecutive_reports = 0
         self._last_forecast_notices: list = []
@@ -157,6 +231,9 @@ class Planner:
         now = parse_utc(payload["now_utc"])
         hours = (now - state.survey_start).total_seconds() / 3600.0
 
+        for message in list(payload.get("new_messages", [])) + [payload.get("latest_bulletin") or {}]:
+            if message.get("record_type") == "bulletin" or "slot_id" in message:
+                self._note_bulletin(message)
         for message in payload.get("new_messages", []):
             if message.get("record_type") == "forecast":
                 self._last_forecast_notices = message.get("notices", [])
@@ -177,6 +254,9 @@ class Planner:
         self._request_thresholds_now = self._request_thresholds(payload.get("active_requests") or [])
 
         night = state.current_night(now)
+        report = self._maybe_report(night[0] if night else None, hours, payload)
+        if report is not None:
+            return report
         if night is None:
             nxt = state.next_night_start(now)
             if nxt is None:
@@ -200,11 +280,10 @@ class Planner:
             return {"action": "wait", "duration_seconds": self._to_next_slot(now, night_start),
                     "reason": "bulletin: rain/storm over the whole sky"}
 
-        report = self._maybe_report(hours, payload)
-        if report is not None:
-            return report
-
+        self._force_dark_if_suspicious(night_index)
         action = self.plan(now, night_end, night_index, hours)
+        if action is not None and state.force_program:
+            self._forced_tonight += 1
         if action is None:
             return {"action": "wait", "duration_seconds": self._to_next_slot(now, night_start),
                     "reason": "nothing useful is up"}
@@ -216,7 +295,8 @@ class Planner:
         self.trace.write({"event": "finish", **payload})
         self.trace.close()
         self.log(f"planner: finished termination_reason={payload.get('termination_reason')} "
-                 f"observes={self.observe_count} reports={self.reports} llm_calls={self.llm.calls_made}")
+                 f"observes={self.observe_count} reports={self.reports} "
+                 f"(correct {self.correct_reports}) llm_calls={self.llm.calls_made}")
 
     def note_action(self, action: dict) -> None:
         """Called by agent.py right after an action is validated, so the consecutive-report
@@ -338,35 +418,311 @@ class Planner:
                           "exposure_bias": advice["exposure_bias"], "pursue_requests": advice["pursue_requests"],
                           "sky_outlook": advice["sky_outlook"], "notes": advice["notes"]})
 
-    # -- instrument fault reporting (deterministic rules only, no model veto) ----
+    # -- instrument fault reporting -------------------------------------------------
+    #
+    # A fault lowers instrument efficiency from some moment until it is reported; nothing
+    # announces it. The detector works night by night on the median "clean ratio"
+    # (observed / modelled quality of exposures with no weather notice in the way):
+    #   * the median is first divided by that night's sky level, estimated from the program
+    #     bands the exposures really scored in (the band ignores instrument efficiency), so
+    #     ordinary night-to-night weather does not look like a fault;
+    #   * outside an earthquake sequence, the result is compared with the median of up to
+    #     FAULT_REF_NIGHTS earlier quiet nights;
+    #   * inside one, efficiency recovers night by night, so it is compared with the level
+    #     the fitted recovery predicts for tonight -- a night clearly under that curve
+    #     cannot be the earthquake.
+    # Enough consecutive low nights -> report at the very next decision, day or night.
+    # A clear-cut drop is reported by rule. A borderline one (between FAULT_STRONG and the
+    # base threshold) is put to the model together with each night's two-hour profile; the
+    # model may report at once or postpone at most FAULT_MAX_LLM_WAITS times, and without
+    # a model verdict the rule waits for one extra low night. After a false report the
+    # rule tightens; once the free allowance is spent and a paid report failed too, it
+    # stops reporting.
 
-    def _maybe_report(self, hours: float, payload: dict):
+    def _night_id(self, night_index: int) -> tuple[str, str]:
+        date = (self.state.nights[night_index][0] - timedelta(hours=12)).date().isoformat()
+        return "N" + date.replace("-", ""), date
+
+    def _note_bulletin(self, bulletin: dict) -> None:
+        night_id = bulletin.get("night_id")
+        if not night_id:
+            return
+        kinds = self._night_kinds.setdefault(night_id, set())
+        for notice in bulletin.get("notices") or []:
+            kind = notice.get("event_kind")
+            if not kind or kind == "terrain_obstruction":
+                continue
+            kinds.add(kind)
+            if kind == "earthquake" and night_id not in self._quake_onset:
+                try:
+                    issued = parse_utc(bulletin["issued_at_utc"])
+                    self._quake_onset[night_id] = (issued - self.state.survey_start).total_seconds() / 3600.0
+                except (KeyError, TypeError, ValueError):
+                    self._quake_onset[night_id] = float("-inf")
+
+    def _fault_mode(self) -> tuple[float, int]:
+        if self.false_reports == 0:
+            return FAULT_BASE
+        if self.false_reports < self.state.false_report_free_allowance:
+            return FAULT_AFTER_FALSE
+        return FAULT_AFTER_ALLOWANCE
+
+    def _quiet_ref(self):
+        """Median sky-corrected level of the last few quiet (no earthquake) nights that
+        were not suspected. Right after a correct report the night records start over; the
+        healthy level from before the fault stands in until new quiet nights exist, so an
+        earthquake that follows straight away still has a reference."""
+        pool = [r["level"] for r in self.fault_nights
+                if r["level"] is not None and not r["quake"] and r["accepted"]]
+        return _median(pool[-FAULT_REF_NIGHTS:]) if pool else self._quiet_fallback
+
+    def _sky_level(self, checks: list, quiet: float):
+        """Tonight's sky relative to the quiet reference, from the program bands the
+        exposures really scored in. The band is a pure sky quantity (instrument efficiency
+        is not in it), so this separates "the sky got worse" from "the instrument got
+        worse". Every candidate level is scored by how many band checks it explains; of the
+        best-explaining levels the one nearest 1.0 is returned, so without evidence to the
+        contrary the sky counts as normal. None when there are too few checks."""
+        if len(checks) < FAULT_SKY_CHECKS_MIN:
+            return None
+        band = self.state.scoring.program_band
+        best, best_levels = -1, []
+        for level in FAULT_SKY_GRID:
+            scale = level * quiet / 0.95
+            agree = sum(1 for program, matched, model in checks if (band(scale * model) == program) == matched)
+            if agree > best:
+                best, best_levels = agree, [level]
+            elif agree == best:
+                best_levels.append(level)
+        return min(best_levels, key=lambda level: abs(level - 1.0))
+
+    def _night_profile(self, night_index: int, expected: float) -> list:
+        """The night in two-hour blocks: [hours after night start, level / expected, samples].
+        An instrument fault is one step that then stays flat; weather wanders."""
+        start_hours = (self.state.nights[night_index][0] - self.state.survey_start).total_seconds() / 3600.0
+        blocks: dict[int, list] = {}
+        for when, ratio, bound in self.state.night_samples(night_index):
+            blocks.setdefault(int(max(0.0, when - start_hours) // 2), []).append((ratio, bound))
+        return [[2 * block, round(_censored_median(samples) / expected, 2), len(samples)]
+                for block, samples in sorted(blocks.items()) if len(samples) >= 5]
+
+    def _expected_level(self, night_index: int, quake: bool, quiet):
+        """The sky-corrected level a healthy instrument should reach tonight, or None when
+        tonight cannot be judged (no reference yet, or the first night of a sequence)."""
+        if not quake:
+            return quiet
+        if self._quake_quiet is None or self._quake_anchor is None:
+            return None
+        anchor_night, loss = self._quake_anchor
+        loss = max(0.0, loss) * self._quake_recovery ** max(0, night_index - anchor_night)
+        return self._quake_quiet * (1.0 - loss)
+
+    @staticmethod
+    def _fault_streak(records: list, threshold: float) -> list:
+        """Ratios of the trailing run of low nights (the ratio is already corrected for the
+        sky). Nights that were not judged (too few samples, no reference) neither extend
+        nor break the run; a judged night above the threshold ends it."""
+        run: list[float] = []
+        for record in reversed(records):
+            ratio = record["ratio"]
+            if ratio is None:
+                continue
+            if ratio > threshold:
+                break
+            run.append(ratio)
+        return run
+
+    @staticmethod
+    def _fault_tier(run: list, mode: tuple) -> str:
+        """"none" (not enough low nights), "strong" (report by rule) or "mid" (borderline:
+        only in the base mode, and only when some counted night is above FAULT_STRONG)."""
+        threshold, needed = mode
+        if len(run) < needed:
+            return "none"
+        if mode == FAULT_BASE and any(ratio > FAULT_STRONG for ratio in run[:needed]):
+            return "mid"
+        return "strong"
+
+    def _maybe_report(self, night_index, hours: float, payload: dict):
+        """Called at every decision. Settles the previous report, closes a night that has
+        just ended, and returns a `report` action when one is due."""
+        state = self.state
+        last_result = payload.get("last_result") or {}
+        if self._awaiting_report_result and last_result.get("action") == "report":
+            self._awaiting_report_result = False
+            self._settle_report(bool(last_result.get("correct")), payload)
+        if self._fault_open_night is not None and night_index != self._fault_open_night:
+            self._close_fault_night(self._fault_open_night, payload)
+            self._fault_open_night = None
+        if night_index is not None and self._fault_open_night is None:
+            self._fault_open_night = night_index
+            self._forced_tonight = 0
+        if self._report_due is None:
+            return None
+        reason, self._report_due = self._report_due, None
+        self.reports += 1
+        self._awaiting_report_result = True
+        self.log(f"planner: reporting instrument fault at {payload.get('now_utc')} ({reason})")
+        return {"action": "report", "reason": reason,
+                "decision_source": "llm" if reason.startswith("model") else "rule"}
+
+    def _settle_report(self, correct: bool, payload: dict) -> None:
+        self.log(f"planner: report at {payload.get('now_utc')} was {'correct' if correct else 'FALSE'}")
+        self._llm_waits = 0
+        if correct:
+            self.correct_reports += 1
+            self.false_reports = 0
+            self._quiet_fallback = self._quiet_ref() or self._quake_quiet or self._quiet_fallback
+            self.state.forget_quality_history()   # the instrument is repaired: learn the level again
+            self.fault_nights = []
+            self._fault_floor = 0
+            self._quake_anchor = None             # re-anchor the recovery curve on the next judged night
+            return
+        self.false_reports += 1
+        # The low level was real and not a fault: accept it as the new normal.
+        counted = 0
+        for record in reversed(self.fault_nights[self._fault_floor:]):
+            if counted >= self._report_streak:
+                break
+            if record["ratio"] is not None:
+                record["accepted"] = True
+                counted += 1
+        last = self.fault_nights[-1] if self.fault_nights else None
+        if last and last["quake"] and last["level"] is not None and self._quake_quiet:
+            self._quake_anchor = (last["index"], 1.0 - last["level"] / self._quake_quiet)
+        self._fault_floor = len(self.fault_nights)
+
+    def _close_fault_night(self, night_index: int, payload: dict) -> None:
+        state = self.state
+        night_id, date = self._night_id(night_index)
+        kinds = self._night_kinds.pop(night_id, set())
+        quake = "earthquake" in kinds
+        quiet = self._quiet_ref()
+        record = {"index": night_index, "date": date, "m": None, "c": 0, "sky": None, "level": None,
+                  "ref": None, "ratio": None, "quake": quake, "sky_ok": True, "kinds": sorted(kinds),
+                  "accepted": True, "profile": []}
+
+        if quake and self._quake_quiet is None:
+            self._quake_quiet = quiet                  # sequence begins: freeze the quiet reference
+            self._quake_anchor = self._quake_first = None
+            self._quake_recovery = 1.0
+        elif not quake:
+            self._quake_quiet = self._quake_anchor = self._quake_first = None
+        first_of_sequence = quake and self._quake_first is None
+        since = self._quake_onset.pop(night_id, None) if first_of_sequence else None
+        ratios = state.night_ratios(night_index, since)
+        record["c"] = len(ratios)
+        sky_base = self._quake_quiet if quake else quiet
+
+        if len(ratios) >= FAULT_MIN_SAMPLES:
+            record["m"] = _censored_median(ratios)
+            sky = self._sky_level(state.night_band_checks(night_index), sky_base) if sky_base else None
+            record["sky"] = sky
+            record["sky_ok"] = sky is None or sky >= FAULT_SKY_OK
+            record["level"] = record["m"] / (sky or 1.0)
+            record["ref"] = self._expected_level(night_index, quake, quiet)
+            if record["ref"]:
+                record["ratio"] = record["level"] / record["ref"]
+        if record["ref"]:
+            record["profile"] = self._night_profile(night_index, record["ref"] * (record["sky"] or 1.0))
+        low = record["ratio"] is not None and record["ratio"] <= FAULT_BASE[0]
+        record["accepted"] = not low
+        if quake and record["level"] is not None and self._quake_quiet and not low:
+            loss = 1.0 - record["level"] / self._quake_quiet
+            if self._quake_first is None:
+                self._quake_first = (night_index, loss)
+            elif night_index > self._quake_first[0] and self._quake_first[1] > 0.05 and loss > 0.0:
+                factor = (loss / self._quake_first[1]) ** (1.0 / (night_index - self._quake_first[0]))
+                self._quake_recovery = min(FAULT_RECOVERY_RANGE[1], max(FAULT_RECOVERY_RANGE[0], factor))
+            self._quake_anchor = (night_index, loss)
+        self.fault_nights.append(record)
+
+        mode = self._fault_mode()
+        run = self._fault_streak(self.fault_nights[self._fault_floor:], mode[0])
+        fmt = lambda v: "n/a" if v is None else f"{v:.2f}"  # noqa: E731
+        self.log(f"planner: night {date} fault-check m={fmt(record['m'])} ref={fmt(record['ref'])} "
+                 f"quake={quake} sky_ok={record['sky_ok']} streak={len(run)} "
+                 f"c={record['c']} sky={fmt(record['sky'])} ratio={fmt(record['ratio'])}"
+                 + (f" recovery={self._quake_recovery:.2f}" if quake else ""))
+        self.trace.write({"event": "fault_check", **record, "streak": len(run)})
+
+        tier = self._fault_tier(run, mode)
+        if not run:
+            self._llm_waits = 0
+        if tier == "none" or record["ratio"] is None:
+            return                                # no alarm, or tonight added no evidence to an old one
+        if self.false_reports > state.false_report_free_allowance:
+            # The free false reports are used up and one paid attempt has already failed:
+            # whatever this is, the detector cannot tell it from a fault. Stop paying.
+            self.log(f"planner: night {date} fault alarm suppressed "
+                     f"({self.false_reports} false reports since the last correct one)")
+            return
+        self._report_streak = len(run)
+        summary = f"{len(run)} low nights, latest {run[0]:.0%} of reference"
+        if tier == "strong":
+            self._report_due = f"rule: {summary}"
+            return
+        # Borderline. Every false alarm seen so far was of this kind and was gone by the
+        # third night, so the rule alone waits for one more low night; the model may report
+        # sooner when the picture is clearly a fault, or hold back at most
+        # FAULT_MAX_LLM_WAITS times.
+        needed = mode[1]
+        if len(run) >= needed + FAULT_MAX_LLM_WAITS:
+            self._report_due = f"rule (borderline, {len(run)} nights): {summary}"
+            return
+        verdict = None
+        if not self.llm.disabled and not self.tape.replaying and self._llm_waits < FAULT_MAX_LLM_WAITS:
+            verdict = self._arbitrate(payload)
+        if verdict == "report":
+            self._report_due = f"model: borderline, {summary}"
+        elif verdict == "wait_one_night":
+            self._llm_waits += 1
+        elif len(run) > needed:
+            self._report_due = f"rule (borderline, no model verdict, {len(run)} nights): {summary}"
+
+    def _arbitrate(self, payload: dict):
+        """Borderline alarm: one model call decides between reporting now and waiting one
+        more night. Returns "report", "wait_one_night", or None when the call failed (the
+        rule then waits for one extra low night)."""
+        rounded = lambda v: None if v is None else round(v, 3)  # noqa: E731
+        nights = [{"date": r["date"], "ratio": rounded(r["ratio"]), "c": r["c"], "sky": rounded(r["sky"]),
+                   "quake": r["quake"], "notice_kinds": r["kinds"], "profile": r["profile"]}
+                  for r in self.fault_nights[-6:]]
+        answer = self.llm.ask_json(
+            FAULT_SYSTEM_PROMPT,
+            {"last_nights": nights, "false_reports_since_last_correct": self.false_reports,
+             "free_false_reports_allowed": self.state.false_report_free_allowance,
+             "times_already_postponed": self._llm_waits},
+            float((payload.get("wallclock") or {}).get("remaining_seconds", 0)),
+        )
+        verdict = answer.get("verdict") if isinstance(answer, dict) else None
+        if verdict not in ("report", "wait_one_night"):
+            self.log("planner: fault arbitration unavailable; the rule decides")
+            return None
+        self.log(f"planner: fault arbitration verdict={verdict} why={str(answer.get('why') or '')[:100]!r}")
+        return verdict
+
+    def _force_dark_if_suspicious(self, night_index: int) -> None:
+        """While tonight's running median looks low, declare DARK on a few exposures: a
+        DARK declaration that scores as DARK shows the sky is fine (so the instrument is
+        not), one that does not shows the sky is to blame."""
         state = self.state
         state.force_program = None
-        if self.reports >= MAX_REPORTS or hours - self.last_report_hours < 24.0:
-            return None
-        evidence = state.fault_evidence()
-        threshold = REPORT_DROP if self.reports == 0 else REPORT_DROP - 0.07
-        if evidence is None or evidence.drop >= threshold:
-            self.suspicion_hours = []
-            return None
-        if evidence.dark_checks < 6:
+        if self._forced_tonight >= FAULT_MAX_FORCED_PER_NIGHT:
+            return
+        night_id, _ = self._night_id(night_index)
+        quake = "earthquake" in self._night_kinds.get(night_id, ())
+        if quake and self._quake_first is None:
+            return
+        expected = self._expected_level(night_index, quake, self._quiet_ref())
+        if not expected:
+            return
+        ratios = state.night_ratios(night_index)
+        if len(ratios) < FAULT_MIN_SAMPLES or _censored_median(ratios) > self._fault_mode()[0] * expected:
+            return
+        dark = sum(1 for program, _matched, _model in state.night_band_checks(night_index) if program == "DARK")
+        if dark < FAULT_DARK_CHECKS_WANTED:
             state.force_program = "DARK"
-        elif evidence.dark_matched < 0.5 * evidence.dark_checks:
-            self.suspicion_hours = []
-            return None
-        if self.suspicion_hours and hours - self.suspicion_hours[-1] < REPORT_SPACING_HOURS:
-            return None
-        self.suspicion_hours.append(hours)
-        if len(self.suspicion_hours) < REPORT_CONFIRMATIONS:
-            return None
-        self.suspicion_hours = []
-        self.reports += 1
-        self.last_report_hours = hours
-        state.forget_quality_history()
-        self.log(f"planner: reporting instrument fault at {payload.get('now_utc')} evidence={evidence}")
-        return {"action": "report", "reason": f"quality dropped to {evidence.drop:.0%} of the earlier level",
-                "decision_source": "rule"}
 
     # -- planning value / achievability -----------------------------------------
 
@@ -687,3 +1043,28 @@ if __name__ == "__main__":
     assert a["ok"] and a["sky_outlook"] == "degraded" and a["exposure_bias"] == 1.05 and a["pursue_requests"], a
     assert len(a["notes"]) == 120, a
     print("planner self-test: _sanitize_advice OK (5 cases)")
+
+    def night(ratio):
+        return {"ratio": ratio}
+    streak, tier = Planner._fault_streak, Planner._fault_tier
+    # two low nights -> strong when both are deep, mid when one is borderline
+    assert tier(streak([night(1.0), night(0.65), night(0.6)], 0.8), FAULT_BASE) == "strong"
+    assert tier(streak([night(1.0), night(0.75), night(0.6)], 0.8), FAULT_BASE) == "mid"
+    # one low night, or a recovery in between, is not enough
+    assert tier(streak([night(0.6), night(1.0), night(0.6)], 0.8), FAULT_BASE) == "none"
+    # unjudged nights neither extend nor break the run
+    assert len(streak([night(0.6), night(None), night(0.7)], 0.8)) == 2
+    # 0.8-0.9 never counts; after a false report three nights at <= 0.70 are needed
+    assert tier(streak([night(0.85), night(0.85)], 0.8), FAULT_BASE) == "none"
+    assert tier(streak([night(0.65), night(0.65)], 0.7), FAULT_AFTER_FALSE) == "none"
+    assert tier(streak([night(0.65), night(0.65), night(0.69)], 0.7), FAULT_AFTER_FALSE) == "strong"
+    assert tier(streak([night(0.65), night(0.65), night(0.69)], 0.6), FAULT_AFTER_ALLOWANCE) == "none"
+    print("planner self-test: fault streak/tier OK (8 cases)")
+
+    exact = [(v, False) for v in (0.2, 0.4, 0.6, 0.8, 1.0)]
+    assert _censored_median(exact) == 0.6
+    # lower bounds above the dips pull the median up to where the real observations are
+    assert _censored_median([(0.1, False), (0.15, False)] + [(0.5, True)] * 6 + [(0.6, False)]) == 0.6
+    # nothing but lower bounds above: the median is at least the largest of them
+    assert _censored_median([(0.1, False)] + [(0.5, True)] * 5) == 0.5
+    print("planner self-test: censored median OK (3 cases)")

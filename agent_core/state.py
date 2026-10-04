@@ -19,8 +19,6 @@ from .scoring import ScoringModel
 
 ALT_MARGIN_DEG = 0.6
 SKY_MEMORY_HOURS = 2.0
-RECENT_SAMPLES = 60
-EARLIER_SAMPLES = 60
 SIDEREAL_DEG_PER_SECOND = 360.98564736629 / 86400.0
 
 
@@ -30,17 +28,6 @@ class PendingPrediction(NamedTuple):
     alt: float
     az: float
     clean: bool            # true when no all-sky notice / directional block applied at plan time
-
-
-class FaultEvidence(NamedTuple):
-    recent_median: float
-    earlier_median: float
-    drop: float
-    recent_samples: int
-    recent_nights: int
-    earlier_samples: int
-    dark_checks: int
-    dark_matched: int
 
 
 def _mod(a: float, n: float) -> float:
@@ -116,9 +103,9 @@ class SurveyState:
         self.prior_scale = 1.0
         self._samples: deque = deque(maxlen=24)           # (hours, ratio)
         self._all_ratios: deque = deque(maxlen=400)        # ratio
-        self.clean_history: list[tuple[float, int, float]] = []  # (hours, night, ratio)
+        self.clean_history: list[tuple[float, int, float, bool]] = []  # (hours, night, ratio, is a lower bound)
         self.pending_night = -1
-        self._band_checks: deque = deque(maxlen=60)        # (program, matched, model)
+        self._band_checks: deque = deque(maxlen=600)       # (program, matched, model, night)
         self.force_program: Optional[str] = None
         self.pending: dict[str, PendingPrediction] = {}
         self.pending_program = "BACKUP"
@@ -270,7 +257,11 @@ class SurveyState:
         return False
 
     def all_sky_notice(self) -> bool:
-        return any(key.partition("|")[2] == "ALL" for key in self.notices)
+        """An ALL-direction weather notice is active. An earthquake notice is not weather:
+        it lowers instrument efficiency for many nights in a row, and the fault detector
+        needs samples from exactly those nights, so it does not make a sample unclean."""
+        return any(key.partition("|")[2] == "ALL" and key.partition("|")[0] != "earthquake"
+                   for key in self.notices)
 
     def on_result(self, last_result: Optional[dict], hours: float) -> None:
         action_index = self.pending_action_index
@@ -302,15 +293,21 @@ class SurveyState:
             multiplier_seen = score / weight
             if prediction.clean:
                 if abs(multiplier_seen - declared_multiplier) < 2e-4:
-                    self._band_checks.append((self.pending_program, True, prediction.model))
+                    self._band_checks.append((self.pending_program, True, prediction.model, self.pending_night))
                 elif abs(multiplier_seen - mismatch) < 2e-4:
-                    self._band_checks.append((self.pending_program, False, prediction.model))
+                    self._band_checks.append((self.pending_program, False, prediction.model, self.pending_night))
             factor_if_match = score / (weight * declared_multiplier) if declared_multiplier > 0 else 0.0
             factor_if_miss = score / (weight * mismatch) if mismatch > 0 else 0.0
             ratio_match = (factor_if_match * f0t0) / (self.flux[i] * self.pending_duration * prediction.model) \
                 if self.flux[i] > 0 and self.pending_duration > 0 and prediction.model > 0 else 0.0
             band = scoring.program_band(ratio_match * prediction.band_model)
             matched = band == self.pending_program
+            if abs(multiplier_seen - mismatch) < 2e-4:
+                # score == weight x mismatch multiplier exactly: a saturated hit in another
+                # band. Without this, a BACKUP/BRIGHT declaration reads it as an unsaturated
+                # match (factor 1/1.06 or 1/1.12) with a tiny ratio, which drags the learned
+                # sky scale down, which makes the planner declare BACKUP again, and so on.
+                matched = False
             factor = factor_if_match if matched else factor_if_miss
             factor = min(1.0, factor)
             self.factor[i] = max(self.factor[i], factor)
@@ -322,8 +319,17 @@ class SurveyState:
                 ratio = (factor * f0t0) / (self.flux[i] * self.pending_duration * prediction.model)
                 self._samples.append((hours, ratio))
                 self._all_ratios.append(ratio)
-                if prediction.clean:
-                    self.clean_history.append((hours, self.pending_night, ratio))
+            # Samples for the fault detector. A score of exactly weight x a program multiplier
+            # is a SATURATED hit: its ratio is only a lower bound (the exposure was longer
+            # than needed), and it is kept as such -- dropping saturated hits would leave
+            # only the worst moments of a night. This also catches the saturated hit in the
+            # wrong band, which the inference above can misread as an unsaturated match
+            # (factor 1/1.06 or 1/1.12) with a far too low ratio.
+            if prediction.clean and self.flux[i] > 0 and self.pending_duration > 0 and prediction.model > 0:
+                saturated = factor >= 0.97 or abs(multiplier_seen - mismatch) < 2e-4 \
+                    or abs(multiplier_seen - declared_multiplier) < 2e-4
+                level = (1.0 if saturated else factor) * f0t0 / (self.flux[i] * self.pending_duration * prediction.model)
+                self.clean_history.append((hours, self.pending_night, level, saturated))
         self.pending.clear()
         self.update_scale(hours)
 
@@ -339,33 +345,20 @@ class SurveyState:
 
     # -- fault diagnostics ------------------------------------------------------
 
-    def fault_evidence(self) -> Optional[FaultEvidence]:
-        history = self.clean_history
-        if len(history) < RECENT_SAMPLES + EARLIER_SAMPLES:
-            return None
-        recent = history[-RECENT_SAMPLES:]
-        earlier = history[:-RECENT_SAMPLES]
-        span = recent[-1][0] - recent[0][0]
-        nights = len({night for _, night, _ in recent})
-        if span < 4.0 or nights < 2:
-            return None
-        recent_sorted = sorted(r for _, _, r in recent)
-        earlier_sorted = sorted(r for _, _, r in earlier)
-        recent_median = recent_sorted[len(recent_sorted) // 2]
-        earlier_median = earlier_sorted[len(earlier_sorted) // 2]
-        dark_line = self.scoring.program_bands["DARK"] * 1.3
-        dark = [c for c in list(self._band_checks)[-16:]
-                if c[0] == "DARK" and (c[2] * earlier_median) / 0.95 >= dark_line]
-        return FaultEvidence(
-            recent_median=round(recent_median, 3),
-            earlier_median=round(earlier_median, 3),
-            drop=round(recent_median / max(1e-9, earlier_median), 3),
-            recent_samples=len(recent),
-            recent_nights=nights,
-            earlier_samples=len(earlier),
-            dark_checks=len(dark),
-            dark_matched=sum(1 for c in dark if c[1]),
-        )
+    def night_ratios(self, night: int, since_hours: Optional[float] = None) -> list[tuple[float, bool]]:
+        """Clean quality ratios (observed / modelled) collected on one night, optionally
+        only those measured at or after `since_hours`, as (ratio, is_lower_bound)."""
+        return [(ratio, bound) for when, n, ratio, bound in self.clean_history
+                if n == night and (since_hours is None or when >= since_hours)]
+
+    def night_samples(self, night: int) -> list[tuple[float, float, bool]]:
+        """(survey hours, ratio, is_lower_bound) for every clean sample of one night."""
+        return [(when, ratio, bound) for when, n, ratio, bound in self.clean_history if n == night]
+
+    def night_band_checks(self, night: int) -> list[tuple[str, bool, float]]:
+        """(declared program, scored as that program, quality model) for every clean hit
+        of one night whose score revealed the program band it really fell in."""
+        return [(c[0], c[1], c[2]) for c in self._band_checks if c[3] == night]
 
     def forget_quality_history(self) -> None:
         self.clean_history = []
