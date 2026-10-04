@@ -44,3 +44,49 @@ class TraceLog:
                 self._handle.close()
             except OSError:
                 pass
+
+
+class AdviceTape:
+    """Local test aid for the nightly LLM advice; inert unless one of these is set
+    (the platform never sets them):
+
+        LLM_RECORD_FILE  append each night's sanitized advice as one JSON line
+                         {night_date: advice}
+        LLM_REPLAY_FILE  read such a file once at startup and replay the advice by
+                         night_date instead of calling the model (a night that is not
+                         in the file gets neutral advice)
+        LLM_MASK_KNOBS   comma-separated knobs to force neutral while replaying, among
+                         exposure_bias, pursue -- for ablations
+
+    Like TraceLog, nothing here may raise into the decision loop.
+    """
+
+    def __init__(self, log=lambda text: None):
+        self.log = log
+        self.record_path = os.environ.get("LLM_RECORD_FILE", "").strip()
+        replay_path = os.environ.get("LLM_REPLAY_FILE", "").strip()
+        self.masked = {k.strip() for k in os.environ.get("LLM_MASK_KNOBS", "").split(",") if k.strip()}
+        self.replaying = bool(replay_path)
+        self._nights: dict = {}
+        if replay_path:
+            try:
+                with open(replay_path, encoding="utf-8") as handle:
+                    for line in handle:
+                        if line.strip():
+                            self._nights.update(json.loads(line))
+            except (OSError, ValueError) as exc:
+                self.log(f"memory: could not read LLM_REPLAY_FILE ({exc}); replaying neutral advice")
+            self.log(f"memory: replaying llm advice for {len(self._nights)} nights, masked={sorted(self.masked)}")
+
+    def replay(self, night_date: str):
+        """The recorded advice for this night (None when the file has none)."""
+        return self._nights.get(night_date)
+
+    def record(self, night_date: str, advice: dict) -> None:
+        if not self.record_path:
+            return
+        try:
+            with open(self.record_path, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps({night_date: advice}, separators=(",", ":")) + "\n")
+        except OSError:
+            pass

@@ -85,6 +85,7 @@ class SurveyState:
         self.flux: list[float] = []
         self.weight: list[float] = []
         self.required: list[bool] = []
+        self.target_class: list[str] = []
         self.index_of: dict[str, int] = {}
 
         columns = init_payload.get("targets", {}).get("columns", [])
@@ -98,6 +99,7 @@ class SurveyState:
             self.flux.append(float(row[col["feature_flux"]]))
             self.weight.append(float(row[col["science_weight"]]))
             self.required.append(bool(row[col["required"]]))
+            self.target_class.append(str(row[col["target_class"]]) if "target_class" in col else "")
 
         n = len(self.ids)
         self.hmax = [max_hour_angle_deg(self.dec[i], self.lat, self.min_alt + ALT_MARGIN_DEG) for i in range(n)]
@@ -124,7 +126,6 @@ class SurveyState:
         self.blocked: list[tuple[float, float]] = []       # (az, alt) where a hit scored zero
         self.notices: set[str] = set()                      # "kind|direction"
         self.terrain: set[str] = set()
-        self.extra_avoid: set[str] = set()
         self.duration_scale = 1.0
         self.fast_level = 0
 

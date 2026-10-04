@@ -11,11 +11,14 @@ program -- or wait / report / finish.
    (DARK / BRIGHT / BACKUP) most assigned targets will match.
 
 Everything here uses only the public catalogue, the public scoring config, and the
-agent's own past hits (SurveyState) -- never hidden weather truth. Once per night, two
-LLM calls run and their answers are merged (see `_night_advice` below): one reads the
-forecast/bulletin notices for tonight, the other reads tonight's live bulletin text and
-the agent's own hit rate so far. A call that keeps failing falls back to its rule-based
-answer for that night; the next night's calls still run normally.
+agent's own past hits (SurveyState) -- never hidden weather truth. Once per night, one
+LLM call (see `_night_advice` below) reads the forecast, the live bulletin and the
+survey's own progress, and answers with BOUNDED knobs only: an exposure bias in 0.9-1.1
+and whether to lean towards observation requests (plus a sky outlook that is logged).
+Direction avoidance and per-class weights were tried as model outputs and removed after
+a replay ablation showed them to cost points. Required targets and instrument-fault
+reports never go through the model. A failed call means neutral advice (= the rule-based path) for that
+night; the next night's call still runs normally.
 
 This mirrors the anchor-search algorithm of this project's companion TypeScript
 example target-for-target, so both examples solve the problem the same way.
@@ -39,7 +42,7 @@ from .geometry import (
     wrap180,
 )
 from .llm_client import LLMClient
-from .memory import TraceLog
+from .memory import AdviceTape, TraceLog
 from .state import PendingPrediction
 
 REQUIRED_BONUS = 60.0
@@ -84,12 +87,42 @@ def _az_distance(a: float, b: float) -> float:
     return abs(wrap180(a - b))
 
 
-def _bulletin_text(notices: list) -> str:
-    """A human-readable rendering of a bulletin's notices, for the LLM call that reads
-    "live bulletin text" rather than structured JSON."""
-    if not notices:
-        return "clear (no active notices)"
-    return "; ".join(f"{n.get('event_kind')} {n.get('direction')}" for n in notices)
+CLASSES = ("QSO", "ELG", "LRG", "BGS", "Star")
+OUTLOOKS = ("good", "degraded", "closed")
+EXPOSURE_BIAS_RANGE = (0.9, 1.1)
+# Skip the nightly call when it could not finish anyway, or when the wall clock is
+# getting short enough that the deterministic search should keep all of it.
+ADVICE_MIN_LLM_BUDGET_SECONDS = 30.0
+ADVICE_MIN_WALLCLOCK_SECONDS = 400.0
+
+ADVICE_SYSTEM_PROMPT = (
+    "You advise a robotic multi-fibre telescope survey once at the start of each night. "
+    "You are given tonight's forecast notices, the next three nights' forecast, the live "
+    "bulletin, the hit rate so far, per-class progress (done_weight / total_weight of "
+    "science weight), how many required targets remain, active observation requests and "
+    "your remaining time budget. Reply with exactly one JSON object and nothing else:\n"
+    '{"sky_outlook": "good|degraded|closed", "exposure_bias": 1.0, '
+    '"pursue_requests": true, "notes": "<=120 chars"}\n'
+    "Rules: exposure_bias is within 0.9-1.1 (above 1 = slightly longer exposures when the "
+    "sky looks poor tonight, below 1 = slightly shorter when it looks excellent; 1.0 = no "
+    "change). sky_outlook describes the whole night. pursue_requests=false only if "
+    "chasing the active requests is clearly not worth it. Pointing directions, target "
+    "choice, required targets and instrument-fault reports are handled by fixed rules "
+    "and are not affected by anything you answer. Values outside the stated range are "
+    "clamped. Answer quickly; do not deliberate at length."
+)
+
+
+def _clamped(value, low: float, high: float, default: float = 1.0) -> float:
+    if isinstance(value, bool):
+        return default
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    if number != number:  # NaN
+        return default
+    return min(high, max(low, number))
 
 
 class Planner:
@@ -99,6 +132,7 @@ class Planner:
         self.grid = state.fiber_grid
         self.llm = LLMClient(log=log)
         self.trace = TraceLog(log=log)
+        self.tape = AdviceTape(log=log)
 
         self.observe_count = 0
         self.reports = 0
@@ -111,6 +145,7 @@ class Planner:
         self.total_hit = 0
         self._current_action_index = None
         self._request_thresholds_now: dict = {}
+        self.pursue_requests = True
 
         log(f"planner: {len(state.ids)} targets ({sum(state.required)} required), "
             f"{len(state.nights)} nights, llm model={self.llm.model} base_url={self.llm.base_url}")
@@ -151,7 +186,9 @@ class Planner:
 
         if self.night_index_seen != night_index:
             self.night_index_seen = night_index
-            self._night_advice(night_start, payload)
+            self._night_advice(night_index, night_start, now, payload)
+            # pursue_requests may just have changed for tonight
+            self._request_thresholds_now = self._request_thresholds(payload.get("active_requests") or [])
 
         if (night_end - now).total_seconds() < state.min_exposure:
             nxt = state.next_night_start(now)
@@ -203,63 +240,105 @@ class Planner:
             self.log(f"planner: pace level {level} ({per_decision * 1000:.0f} ms per decision left)")
             state.fast_level = level
 
-    # -- LLM: two calls once per night, merged -----------------------------------
+    # -- LLM: one bounded call per night ------------------------------------------
 
-    def _night_advice(self, night_start, payload: dict) -> None:
-        """Two independent planning questions, asked once at the start of each night,
-        each answered as {avoid_directions, duration_scale}. Their answers are merged
-        (directions to avoid are unioned; the duration scale is averaged) before being
-        applied to state.extra_avoid / state.duration_scale for the rest of the night."""
+    @staticmethod
+    def _sanitize_advice(answer) -> dict:
+        """Turn whatever the model returned into bounded advice. Anything missing,
+        malformed or out of range becomes neutral, so the worst a bad reply can do is
+        nothing. Returns {"ok", "sky_outlook", "exposure_bias", "pursue_requests",
+        "notes"}; ok=False means the reply was unusable as a whole. Keys the interface
+        does not have (e.g. directions to avoid) are ignored."""
+        advice = {"ok": False, "sky_outlook": "unknown", "exposure_bias": 1.0,
+                  "pursue_requests": True, "notes": ""}
+        if not isinstance(answer, dict):
+            return advice
+        advice["ok"] = True
+        outlook = str(answer.get("sky_outlook", "")).strip().lower()
+        if outlook in OUTLOOKS:
+            advice["sky_outlook"] = outlook
+        advice["exposure_bias"] = _clamped(answer.get("exposure_bias", 1.0), *EXPOSURE_BIAS_RANGE)
+        if isinstance(answer.get("pursue_requests"), bool):
+            advice["pursue_requests"] = answer["pursue_requests"]
+        advice["notes"] = str(answer.get("notes") or "")[:120]
+        return advice
+
+    def _progress_by_class(self) -> dict:
+        state = self.state
+        progress = {name: {"done_weight": 0.0, "total_weight": 0.0} for name in CLASSES}
+        for i, name in enumerate(state.target_class):
+            entry = progress.get(name)
+            if entry is None:
+                continue
+            entry["total_weight"] += state.weight[i]
+            if state.factor[i] >= 0.5:
+                entry["done_weight"] += state.weight[i]
+        return {name: {k: round(v, 1) for k, v in entry.items()} for name, entry in progress.items()}
+
+    def _night_advice(self, night_index: int, night_start, now, payload: dict) -> None:
+        """One planning question at the start of each night. The answer is sanitized into
+        bounded knobs (_sanitize_advice) and applied for the rest of the night:
+        state.duration_scale and self.pursue_requests.
+        sky_outlook is only logged for now."""
         state = self.state
         night_date = (night_start - timedelta(hours=12)).date().isoformat()
         left = float((payload.get("wallclock") or {}).get("remaining_seconds", 0))
 
+        next_dates = {(night_start - timedelta(hours=12) + timedelta(days=d)).date().isoformat() for d in (1, 2, 3)}
         forecast_tonight = [n for n in self._last_forecast_notices if night_date in (n.get("nights") or [])]
+        forecast_next = [n for n in self._last_forecast_notices if next_dates & set(n.get("nights") or [])]
         bulletin_notices = (payload.get("latest_bulletin") or {}).get("notices", [])
-        answer_forecast = self.llm.ask_json(
-            "You help schedule a telescope survey. Reply with one JSON object only: "
-            '{"avoid_directions": [compass codes among N,NE,E,SE,S,SW,W,NW], "duration_scale": '
-            "number 0.7-1.4}. Avoid directions with bad weather tonight, going by the forecast "
-            "and the current bulletin; use a larger duration_scale when the sky looks poor.",
-            {"night": night_date, "forecast_notices_for_tonight": forecast_tonight,
-             "current_bulletin_notices": bulletin_notices},
-            left,
-        )
-
         hit_rate = (self.total_hit / self.total_assigned) if self.total_assigned > 0 else 1.0
-        answer_bulletin = self.llm.ask_json(
-            "You help schedule a telescope survey using tonight's live weather bulletin and the "
-            'agent\'s own recent hit rate. Reply with one JSON object only: {"avoid_directions": '
-            '[compass codes among N,NE,E,SE,S,SW,W,NW], "duration_scale": number 0.7-1.4}. Avoid '
-            "directions the bulletin text describes as closed or obstructed right now. Raise "
-            "duration_scale when the hit rate has been low (the sky has been performing poorly); "
-            "lower it when the hit rate has been high.",
-            {"night": night_date, "bulletin_text": _bulletin_text(bulletin_notices),
-             "hit_rate_so_far": round(hit_rate, 3)},
-            left,
-        )
-
-        avoid: set[str] = set()
-        scales: list[float] = []
-        for answer in (answer_forecast, answer_bulletin):
-            if not answer:
-                continue
-            avoid |= {str(d).upper() for d in (answer.get("avoid_directions") or []) if str(d).upper() in DIRECTION_AZ}
+        threshold = state.scoring.required_threshold
+        requests = []
+        for request in payload.get("active_requests") or []:
             try:
-                scales.append(min(1.4, max(0.7, float(answer.get("duration_scale", 1.0)))))
-            except (TypeError, ValueError):
-                pass
-        state.extra_avoid = avoid
-        state.duration_scale = sum(scales) / len(scales) if scales else 1.0
-        self.log(f"planner: night {night_date} llm advice (forecast call: "
-                 f"{'ok' if answer_forecast else 'fell back'}, bulletin call: "
-                 f"{'ok' if answer_bulletin else 'fell back'}) merged avoid={sorted(avoid)} "
-                 f"duration x{state.duration_scale:.2f}")
-        self.trace.write({"event": "night_advice", "night_date": night_date, "avoid": sorted(avoid),
-                          "scale": state.duration_scale, "forecast_call_ok": bool(answer_forecast),
-                          "bulletin_call_ok": bool(answer_bulletin)})
+                hours_left = round((parse_utc(request["deadline_utc"]) - now).total_seconds() / 3600.0, 1)
+            except (KeyError, TypeError, ValueError):
+                hours_left = None
+            requests.append({"request_id": request.get("request_id"),
+                             "remaining_count": request.get("remaining_count"),
+                             "hours_left": hours_left})
+        user_payload = {
+            "night_date": night_date,
+            "nights_remaining": len(state.nights) - night_index,
+            "forecast_notices_for_tonight": forecast_tonight,
+            "forecast_notices_next_3_nights": forecast_next,
+            "current_bulletin_notices": bulletin_notices,
+            "hit_rate_so_far": round(hit_rate, 3),
+            "progress_by_class": self._progress_by_class(),
+            "required_remaining": sum(1 for i in range(len(state.ids))
+                                      if state.required[i] and state.factor[i] < threshold),
+            "active_requests": requests,
+            "llm_budget_left_seconds": round(self.llm.budget_left_seconds()),
+        }
+        if self.tape.replaying:
+            advice = self._sanitize_advice(self.tape.replay(night_date))
+            neutral = self._sanitize_advice(None)
+            for knob, key in (("exposure_bias", "exposure_bias"), ("pursue", "pursue_requests")):
+                if knob in self.tape.masked:
+                    advice[key] = neutral[key]
+            status = "replay"
+        elif self.llm.disabled:
+            advice, status = self._sanitize_advice(None), "disabled"
+        elif self.llm.budget_left_seconds() < ADVICE_MIN_LLM_BUDGET_SECONDS or left < ADVICE_MIN_WALLCLOCK_SECONDS:
+            advice, status = self._sanitize_advice(None), "skipped"
+        else:
+            advice = self._sanitize_advice(self.llm.ask_json(ADVICE_SYSTEM_PROMPT, user_payload, left))
+            status = "ok" if advice["ok"] else "fell back"
+        self.tape.record(night_date, {"sky_outlook": advice["sky_outlook"],
+                                      "exposure_bias": advice["exposure_bias"],
+                                      "pursue_requests": advice["pursue_requests"], "notes": advice["notes"]})
 
-    # -- instrument fault reporting (deterministic rules + LLM confirmation) -----
+        state.duration_scale = advice["exposure_bias"]
+        self.pursue_requests = advice["pursue_requests"]
+        self.log(f"planner: night {night_date} llm advice {status} bias={advice['exposure_bias']:.2f} "
+                 f"pursue={advice['pursue_requests']} outlook={advice['sky_outlook']}")
+        self.trace.write({"event": "night_advice", "night_date": night_date, "status": status,
+                          "exposure_bias": advice["exposure_bias"], "pursue_requests": advice["pursue_requests"],
+                          "sky_outlook": advice["sky_outlook"], "notes": advice["notes"]})
+
+    # -- instrument fault reporting (deterministic rules only, no model veto) ----
 
     def _maybe_report(self, hours: float, payload: dict):
         state = self.state
@@ -282,23 +361,12 @@ class Planner:
         if len(self.suspicion_hours) < REPORT_CONFIRMATIONS:
             return None
         self.suspicion_hours = []
-        verdict_answer = self.llm.ask_json(
-            "You check telescope data quality. A false instrument-fault report costs points, "
-            'a correct one earns points. Reply with one JSON object only: {"report": true|false}.',
-            evidence._asdict(), float((payload.get("wallclock") or {}).get("remaining_seconds", 0)),
-        )
-        verdict = verdict_answer.get("report") if isinstance(verdict_answer, dict) and \
-            isinstance(verdict_answer.get("report"), bool) else None
-        if verdict is False:
-            self.log(f"planner: report vetoed by the model at {payload.get('now_utc')} ({evidence})")
-            self.last_report_hours = hours
-            return None
         self.reports += 1
         self.last_report_hours = hours
         state.forget_quality_history()
         self.log(f"planner: reporting instrument fault at {payload.get('now_utc')} evidence={evidence}")
         return {"action": "report", "reason": f"quality dropped to {evidence.drop:.0%} of the earlier level",
-                "decision_source": "llm-confirmed" if verdict else "rule"}
+                "decision_source": "rule"}
 
     # -- planning value / achievability -----------------------------------------
 
@@ -317,9 +385,6 @@ class Planner:
                 return 0.0
             if near and alt < 75.0:
                 factor = min(factor, 0.35)
-        for direction in state.extra_avoid:
-            if direction in DIRECTION_AZ and _az_distance(az, DIRECTION_AZ[direction]) <= 67.5 and alt < 70.0:
-                factor = min(factor, 0.35)
         for blocked_az, blocked_alt in state.blocked[-40:]:
             if _az_distance(az, blocked_az) <= 12.0 and alt <= blocked_alt + 3.0:
                 factor = min(factor, 0.2)
@@ -335,6 +400,8 @@ class Planner:
         runs once request targets happen to already be among its assigned fibres."""
         state = self.state
         thresholds: dict[int, float] = {}
+        if not self.pursue_requests:
+            return thresholds
         for request in active_requests:
             if int(request.get("remaining_count", 0)) <= 0:
                 continue
@@ -590,3 +657,33 @@ class Planner:
             "duration_seconds": duration,
             "program": program,
         }
+
+
+if __name__ == "__main__":
+    # Self-test for the advice sanitizer: python3 -m agent_core.planner
+    clean = Planner._sanitize_advice
+    neutral = {"ok": False, "sky_outlook": "unknown", "exposure_bias": 1.0, "pursue_requests": True, "notes": ""}
+
+    # 1. out-of-range bias is clamped, both ends
+    assert clean({"exposure_bias": 1.4})["exposure_bias"] == 1.1
+    assert clean({"exposure_bias": 0.2})["exposure_bias"] == 0.9
+
+    # 2. unusable reply -> neutral
+    for bad in (None, "not json", [], 3):
+        assert clean(bad) == neutral, clean(bad)
+
+    # 3. wrong types inside an object -> that knob neutral, reply still counts
+    a = clean({"exposure_bias": "nan", "pursue_requests": "no", "sky_outlook": 7})
+    assert a == {**neutral, "ok": True}, a
+    assert clean({"exposure_bias": True})["exposure_bias"] == 1.0
+
+    # 4. knobs the interface no longer has are ignored, never applied
+    a = clean({"sky_outlook": "closed", "avoid_directions": ["N", "NE", "E", "SE", "S", "SW", "W", "NW"],
+               "class_weights": {"QSO": 3.0}, "duration_scale": 0.7, "pursue_requests": False})
+    assert a == {"ok": True, "sky_outlook": "closed", "exposure_bias": 1.0, "pursue_requests": False, "notes": ""}, a
+
+    # 5. a normal reply passes through
+    a = clean({"sky_outlook": "Degraded", "exposure_bias": "1.05", "pursue_requests": True, "notes": "x" * 300})
+    assert a["ok"] and a["sky_outlook"] == "degraded" and a["exposure_bias"] == 1.05 and a["pursue_requests"], a
+    assert len(a["notes"]) == 120, a
+    print("planner self-test: _sanitize_advice OK (5 cases)")

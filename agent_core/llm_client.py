@@ -20,12 +20,17 @@ local run can differ without code changes):
     LLM_USER_AGENT           when set, sent as the HTTP User-Agent (identifying this agent
                              truthfully); when unset the header is left to the standard
                              library, exactly like the official example
-    LLM_CALL_TIMEOUT_SECONDS default 20; LLM_TOTAL_BUDGET_SECONDS default 300;
-    LLM_MAX_CALLS default 100; LLM_MAX_RETRIES default 2
+    LLM_CALL_TIMEOUT_SECONDS default 25; LLM_TOTAL_BUDGET_SECONDS default 340;
+    LLM_MAX_CALLS default 100; LLM_MAX_RETRIES default 0 (retries AFTER the first
+                             attempt; 0 = a timed-out call is not repeated)
+    LLM_DISABLED             "1" switches the model off entirely: no API key is needed,
+                             ask_json returns None without touching the network, and every
+                             planning step takes its rule-based answer. For deterministic
+                             offline regression runs only.
 
 Every call has a timeout and the whole run has a total time budget and a call cap, so
 the LLM-advised planning steps stay well inside the 900 s wall clock. A call that fails
-or times out is retried up to `max_retries` times; if all of those fail, that one
+or times out is retried up to `max_retries` more times; if all attempts fail, that one
 planning step falls back to its rule-based answer for this night -- the next night's
 calls still go through normally.
 
@@ -57,24 +62,33 @@ class MissingAPIKeyError(RuntimeError):
     pass
 
 
+def llm_disabled() -> bool:
+    return os.environ.get("LLM_DISABLED", "").strip() == "1"
+
+
 def require_api_key() -> None:
     """Raise MissingAPIKeyError if neither OPENAI_API_KEY nor KIMI_API_KEY is set.
-    Called once at process startup, before reading anything from stdin."""
+    Called once at process startup, before reading anything from stdin.
+    Does not raise when LLM_DISABLED=1 (offline deterministic runs need no key)."""
+    if llm_disabled():
+        return
     if not (os.environ.get("OPENAI_API_KEY", "").strip() or os.environ.get("KIMI_API_KEY", "").strip()):
         raise MissingAPIKeyError("missing API key: set OPENAI_API_KEY")
 
 
 class LLMClient:
-    def __init__(self, log=lambda text: None, call_timeout_seconds: float = 20.0,
-                 total_budget_seconds: float = 300.0, max_calls: int = 100, max_retries: int = 2):
+    def __init__(self, log=lambda text: None, call_timeout_seconds: float = 25.0,
+                 total_budget_seconds: float = 340.0, max_calls: int = 100, max_retries: int = 0):
         self.log = log
+        self.disabled = llm_disabled()
+        self._disabled_logged = False
         self.base_url = os.environ.get("OPENAI_BASE_URL", "").strip().rstrip("/") or DEFAULT_BASE_URL
         self.api_key = os.environ.get("OPENAI_API_KEY", "").strip() or os.environ.get("KIMI_API_KEY", "").strip()
         self.model = os.environ.get("OPENAI_MODEL", "").strip() or DEFAULT_MODEL
         self.call_timeout_seconds = _env_float("LLM_CALL_TIMEOUT_SECONDS", call_timeout_seconds)
         self.total_budget_seconds = _env_float("LLM_TOTAL_BUDGET_SECONDS", total_budget_seconds)
         self.max_calls = int(_env_float("LLM_MAX_CALLS", max_calls))
-        self.max_retries = max(1, int(_env_float("LLM_MAX_RETRIES", max_retries)))
+        self.max_retries = max(0, int(_env_float("LLM_MAX_RETRIES", max_retries)))
         self.max_tokens = int(_env_float("LLM_MAX_TOKENS", 1200))
         temp = os.environ.get("LLM_TEMPERATURE", "").strip()
         self.temperature = float(temp) if temp else None
@@ -84,7 +98,11 @@ class LLMClient:
         self.successes = 0
         self.log(f"llm: model={self.model} base={self.base_url} timeout={self.call_timeout_seconds:.0f}s "
                  f"budget={self.total_budget_seconds:.0f}s max_tokens={self.max_tokens} "
-                 f"temperature={'omitted' if self.temperature is None else self.temperature}")
+                 f"temperature={'omitted' if self.temperature is None else self.temperature}"
+                 f"{' DISABLED' if self.disabled else ''}")
+
+    def budget_left_seconds(self) -> float:
+        return max(0.0, self.total_budget_seconds - self.spent_seconds)
 
     def _budget_left(self, wallclock_remaining_seconds: float) -> float:
         # Never let a model call eat into the last minute of wall clock, and never
@@ -134,10 +152,15 @@ class LLMClient:
 
     def ask_json(self, system_prompt: str, user_payload: dict, wallclock_remaining_seconds: float) -> Optional[dict]:
         """One planning question, answered as exactly one JSON object. Retries up to
-        `max_retries` times on failure; returns None once the budget/call cap/retries
+        `max_retries` more times on failure; returns None once the budget/call cap/retries
         are exhausted, so the caller's rule-based answer can take over for this step."""
+        if self.disabled:
+            if not self._disabled_logged:
+                self._disabled_logged = True
+                self.log("llm: LLM_DISABLED=1; every step uses the rule-based path")
+            return None
         last_error: Optional[Exception] = None
-        for _attempt_number in range(self.max_retries):
+        for _attempt_number in range(1 + self.max_retries):
             if self.calls_made >= self.max_calls:
                 self.log("llm: call cap reached for this run; using the rule-based path")
                 return None
@@ -157,6 +180,6 @@ class LLMClient:
                 last_error = exc
             finally:
                 self.spent_seconds += time.monotonic() - started
-        self.log(f"llm: call failed after {self.max_retries} attempts ({type(last_error).__name__}); "
+        self.log(f"llm: call failed after {1 + self.max_retries} attempt(s) ({type(last_error).__name__}); "
                  "this step falls back to its rule-based answer")
         return None
