@@ -142,6 +142,16 @@ def _censored_median(samples: list) -> float:
 # target that is not already going to be exposed anyway) for a chance at the reward.
 REQUEST_RATE_TOLERANCE = 0.9
 
+# Active pursuit of a request (see _pick_request_target). Only exposures that lie wholly
+# inside the request window count, each needed target must reach the threshold in ONE
+# exposure, and nothing is lost when a request expires -- so a request is pursued only
+# while enough of its targets are cheaply reachable, and dropped the moment they are not.
+# A pursued target becomes the pointing's anchor; the other fibres are filled as usual, so
+# the exposure still earns ordinary science score.
+REQUEST_MARGIN = 1.15         # aim this far above the completion threshold
+REQUEST_MAX_SECONDS = 1800    # a target needing a longer exposure than this is not worth it
+REQUEST_MAX_TRIES = 2         # per target, per request
+
 
 def _az_distance(a: float, b: float) -> float:
     return abs(wrap180(a - b))
@@ -152,11 +162,13 @@ OUTLOOKS = ("good", "degraded", "closed")
 EXPOSURE_BIAS_RANGE = (0.9, 1.1)
 # Skip the nightly call when it could not finish anyway, or when the wall clock is
 # getting short enough that the deterministic search should keep all of it. Both wall-clock
-# figures are fractions of the card's own limit (400 s and 340 s on a 900 s card), so a
-# card with a shorter limit still gets its share of model calls.
+# figures are fractions of the card's own limit (250 s and 500 s on a 900 s card), so a
+# card with a shorter limit still gets its share of model calls. The deterministic part
+# needs well under 100 s, so 500 s of model time fits even if waiting on the model is
+# charged against the limit.
 ADVICE_MIN_LLM_BUDGET_SECONDS = 30.0
-ADVICE_MIN_WALLCLOCK_FRACTION = 400.0 / 900.0
-LLM_BUDGET_FRACTION = 340.0 / 900.0
+ADVICE_MIN_WALLCLOCK_FRACTION = 250.0 / 900.0
+LLM_BUDGET_FRACTION = 500.0 / 900.0
 
 ADVICE_SYSTEM_PROMPT = (
     "You advise a robotic multi-fibre telescope survey once at the start of each night. "
@@ -228,6 +240,11 @@ class Planner:
         self._current_action_index = None
         self._request_thresholds_now: dict = {}
         self.pursue_requests = True
+        self._active_requests: list = []
+        self._request_tries: dict = {}                # (request_id, target index) -> forced exposures so far
+        self._request_status: dict = {}               # request_id -> last logged "pursue"/"drop"
+        self._forced_request: tuple | None = None     # (target index, threshold, seconds to deadline, request_id)
+        self.request_exposures = 0
 
         log(f"planner: {len(state.ids)} targets ({sum(state.required)} required), "
             f"{len(state.nights)} nights, llm model={self.llm.model} base_url={self.llm.base_url}")
@@ -259,6 +276,7 @@ class Planner:
             self.total_hit += int(last_result.get("hit_count", 0))
         self._pace(payload, now)
         self._current_action_index = payload.get("observe_action_index")
+        self._active_requests = payload.get("active_requests") or []
         self._request_thresholds_now = self._request_thresholds(payload.get("active_requests") or [])
 
         night = state.current_night(now)
@@ -303,7 +321,7 @@ class Planner:
         self.trace.write({"event": "finish", **payload})
         self.trace.close()
         self.log(f"planner: finished termination_reason={payload.get('termination_reason')} "
-                 f"observes={self.observe_count} reports={self.reports} "
+                 f"observes={self.observe_count} request_exposures={self.request_exposures} reports={self.reports} "
                  f"(correct {self.correct_reports}) llm_calls={self.llm.calls_made}")
 
     def note_action(self, action: dict) -> None:
@@ -783,6 +801,85 @@ class Planner:
                     thresholds[i] = threshold
         return thresholds
 
+    def _request_reach(self, i: int, lst: float, moon, time_left: float, threshold: float):
+        """(seconds needed, seconds the target stays up) if target i can clear `threshold`
+        with margin in one exposure starting now, else None."""
+        state, scoring = self.state, self.state.scoring
+        h = state.hmax[i]
+        ha = wrap180(lst - state.ra[i])
+        if h <= 0.0 or not (-h <= ha <= h):
+            return None
+        up = (h - ha) / SIDEREAL_DEG_PER_SECOND if h < 180 else 1e9
+        alt, az = radec_to_altaz(state.ra[i], state.dec[i], lst, state.lat)
+        if self._direction_factor(alt, az) < 1.0:
+            return None
+        model = scoring.quality_model(alt, lunar_factor(moon, state.ra[i], state.dec[i], scoring.lunar_model)) or 0.0
+        k = (state.flux[i] * model * state.scale * PLAN_FACTOR_SAFETY) / scoring.f0t0
+        if k <= 0.0:
+            return None
+        needed = threshold * REQUEST_MARGIN / k
+        if needed > min(REQUEST_MAX_SECONDS, up, time_left, state.max_exposure):
+            return None
+        return needed, up
+
+    def _request_reachable_later(self, i: int, lst: float, threshold: float, deadline, night_index: int,
+                                 seconds_left: float) -> bool:
+        """Optimistic check: could target i still clear the threshold later in the window
+        (later tonight while it is still rising, or on a later night before the deadline)?"""
+        state, scoring = self.state, self.state.scoring
+        h = state.hmax[i]
+        if h <= 0.0:
+            return False
+        best_alt = min(89.0, 90.0 - abs(state.dec[i] - state.lat))
+        k = (state.flux[i] * (scoring.quality_model(best_alt, 1.0) or 0.0) * state.scale * PLAN_FACTOR_SAFETY) / scoring.f0t0
+        if k <= 0.0 or threshold * REQUEST_MARGIN / k > REQUEST_MAX_SECONDS:
+            return False
+        ha = wrap180(lst - state.ra[i])
+        if ha < 0.0 and (-ha - min(h, -ha)) / SIDEREAL_DEG_PER_SECOND + REQUEST_MAX_SECONDS < seconds_left:
+            return True                              # still east of the meridian with time left tonight
+        return any(start < deadline and state.first_night[i] <= n <= state.last_night[i]
+                   for n, (start, _end) in enumerate(state.nights) if n > night_index)
+
+    def _pick_request_target(self, now, lst: float, moon, seconds_left: float, night_index: int):
+        """The request target to anchor the next exposure on, or None. A request is pursued
+        only while (targets reachable now) + (targets reachable later) covers what it still
+        needs; among the targets reachable now the cheapest goes first."""
+        state = self.state
+        best = None  # (seconds needed, target index, threshold, seconds to deadline, request_id)
+        for request in self._active_requests:
+            need = int(request.get("remaining_count", 0))
+            if need <= 0:
+                continue
+            request_id = request.get("request_id")
+            try:
+                deadline = parse_utc(request["deadline_utc"])
+                threshold = float(request["completion_factor_threshold"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            deadline_left = (deadline - now).total_seconds()
+            completed = set(request.get("completed_target_ids") or [])
+            now_ok, later = [], 0
+            for target_id in request.get("target_ids", []):
+                i = state.index_of.get(target_id)
+                if i is None or target_id in completed or \
+                        self._request_tries.get((request_id, i), 0) >= REQUEST_MAX_TRIES:
+                    continue
+                reach = self._request_reach(i, lst, moon, min(seconds_left, deadline_left), threshold)
+                if reach is not None:
+                    now_ok.append((reach[0], i))
+                elif self._request_reachable_later(i, lst, threshold, deadline, night_index, seconds_left):
+                    later += 1
+            status = "pursue" if len(now_ok) + later >= need else "drop"
+            if self._request_status.get(request_id) != status:
+                self._request_status[request_id] = status
+                self.log(f"planner: request {request_id} {status}: needs {need} more, "
+                         f"{len(now_ok)} reachable now, {later} later")
+            if status == "pursue" and now_ok:
+                needed, i = min(now_ok)
+                if best is None or needed < best[0]:
+                    best = (needed, i, threshold, deadline_left, request_id)
+        return best
+
     def _value(self, i: int) -> float:
         """Planning value of fully completing target i from here (ignores how much
         exposure is achievable tonight)."""
@@ -798,7 +895,7 @@ class Planner:
 
     # -- main planning pass -------------------------------------------------------
 
-    def plan(self, now, night_end, night_index: int, hours: float):
+    def plan(self, now, night_end, night_index: int, hours: float, allow_request: bool = True):
         state = self.state
         state.update_scale(hours)
         lst = local_sidereal_deg(now, state.lon)
@@ -861,12 +958,18 @@ class Planner:
             return result
 
         anchors: list[tuple[float, int]] = []
-        for checked, (priority, i) in enumerate(candidates):
-            if checked >= ANCHOR_POOL and len(anchors) >= 3 * ANCHORS:
-                break
-            weighted = achievable(i) * priority / max(1e-9, self._value(i))
-            if weighted > 0:
-                anchors.append((weighted, i))
+        request = self._pick_request_target(now, lst, moon, seconds_left, night_index) \
+            if allow_request and state.fast_level == 0 else None
+        forced = request[1] if request is not None else None
+        if forced is not None:
+            anchors = [(1.0, forced)]
+        else:
+            for checked, (priority, i) in enumerate(candidates):
+                if checked >= ANCHOR_POOL and len(anchors) >= 3 * ANCHORS:
+                    break
+                weighted = achievable(i) * priority / max(1e-9, self._value(i))
+                if weighted > 0:
+                    anchors.append((weighted, i))
         if not anchors:
             return None
         anchors.sort(key=lambda t: -t[0])
@@ -906,15 +1009,32 @@ class Planner:
                     existing = chosen.get(fib)
                     if existing is None or score > existing[0]:
                         chosen[fib] = (score, j, margin)
+                if forced is not None:
+                    # the request target keeps the fibre it was centred on, whatever else
+                    # would have scored higher in that cell
+                    offsets = tangent_offsets(a_alt, a_az, c_alt, c_az)
+                    fib, margin = self.grid.classify(*offsets) if offsets is not None else (None, 0.0)
+                    if fib is None or margin < EDGE_MARGIN_DEG:
+                        continue
+                    chosen[fib] = (0.0, forced, margin)
                 if not chosen:
                     continue
                 total = sum(score for score, _, _ in chosen.values())
                 if best is None or total > best[0]:
                     best = (total, c_alt, c_az, chosen)
         if best is None:
-            return None
+            return self.plan(now, night_end, night_index, hours, allow_request=False) if forced is not None else None
         _, c_alt, c_az, chosen = best
-        return self._finish_plan(now, lst, c_alt, c_az, chosen, seconds_left, moon, altaz, hours, night_index)
+        self._forced_request = (forced, request[2], request[3], request[4]) if forced is not None else None
+        action = self._finish_plan(now, lst, c_alt, c_az, chosen, seconds_left, moon, altaz, hours, night_index)
+        self._forced_request = None
+        if forced is not None:
+            if action is None:
+                return self.plan(now, night_end, night_index, hours, allow_request=False)
+            key = (request[4], forced)
+            self._request_tries[key] = self._request_tries.get(key, 0) + 1
+            self.request_exposures += 1
+        return action
 
     def _finish_plan(self, now, lst, c_alt, c_az, chosen, seconds_left, moon, altaz, hours, night_index):
         state = self.state
@@ -935,6 +1055,8 @@ class Planner:
         center_up = (c_hmax - c_ha) / SIDEREAL_DEG_PER_SECOND if c_hmax < 180 else 1e9
 
         best = None  # (rate, duration)
+        forced = self._forced_request   # (target index, threshold, seconds to deadline, request_id) or None
+        forced_best = None  # (rate, duration): best candidate that completes the pursued request target
         request_best = None  # (rate, duration): best candidate that also clears a needed
                               # request target's completion_factor_threshold
         for base in DURATIONS:
@@ -960,6 +1082,15 @@ class Planner:
                 best = (rate, duration)
             if completes_request and (request_best is None or rate > request_best[0]):
                 request_best = (rate, duration)
+            if forced is not None and duration <= forced[2] and any(
+                    item["i"] == forced[0] and item["up"] >= duration
+                    and min(1.0, item["k"] * duration) >= min(1.0, forced[1] * REQUEST_MARGIN)
+                    for item in info.values()) and (forced_best is None or rate > forced_best[0]):
+                forced_best = (rate, duration)
+        if forced is not None:
+            if forced_best is None:
+                return None
+            best = request_best = forced_best
         if best is None:
             return None
         # Tie-break, not a bonus: duration_seconds is one value shared by all 16 fibres,
@@ -970,7 +1101,7 @@ class Planner:
         if request_best is not None and request_best[0] >= best[0] * REQUEST_RATE_TOLERANCE:
             best = request_best
         duration = best[1]
-        if best[0] <= 0.0:
+        if best[0] <= 0.0 and forced is None:
             if state.has_recent_sample(hours):
                 return None
             fallback = next((d for d in (900, 600, 300) if d <= seconds_left and d <= center_up), None)

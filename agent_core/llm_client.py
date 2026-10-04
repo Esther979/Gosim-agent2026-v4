@@ -20,7 +20,7 @@ local run can differ without code changes):
     LLM_USER_AGENT           when set, sent as the HTTP User-Agent (identifying this agent
                              truthfully); when unset the header is left to the standard
                              library, exactly like the official example
-    LLM_CALL_TIMEOUT_SECONDS default 25; LLM_TOTAL_BUDGET_SECONDS default 340;
+    LLM_CALL_TIMEOUT_SECONDS default 25; LLM_TOTAL_BUDGET_SECONDS default 500;
     LLM_MAX_CALLS default 100; LLM_MAX_RETRIES default 0 (retries AFTER the first
                              attempt; 0 = a timed-out call is not repeated)
     LLM_DISABLED             "1" switches the model off entirely: no API key is needed,
@@ -78,7 +78,7 @@ def require_api_key() -> None:
 
 class LLMClient:
     def __init__(self, log=lambda text: None, call_timeout_seconds: float = 25.0,
-                 total_budget_seconds: float = 340.0, max_calls: int = 100, max_retries: int = 0):
+                 total_budget_seconds: float = 500.0, max_calls: int = 100, max_retries: int = 0):
         self.log = log
         self.disabled = llm_disabled()
         self._disabled_logged = False
