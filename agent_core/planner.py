@@ -25,6 +25,7 @@ example target-for-target, so both examples solve the problem the same way.
 """
 from __future__ import annotations
 
+import math
 from datetime import timedelta
 
 from .geometry import (
@@ -55,6 +56,22 @@ NEIGHBOUR_RADIUS_FRACTION = 0.83      # of the field side: far enough to fill a 
 MAX_CENTRE_FIBRES = 25                # fibres tried as the pointing centre per anchor
 FAST_CENTRE_FIBRES = 4
 ANCHORS = 6
+# Joint search (see _joint_search): pointing, fibre assignment and exposure length are
+# chosen together, by expected score per second. One exposure length is shared by every
+# fibre, so the fibres must be filled with targets that need about that long -- picking the
+# targets first and the length afterwards leaves bright targets saturated and waiting while
+# the faint ones are still short.
+JOINT_DURATIONS = (180, 240, 300, 450, 600, 750, 900, 1200, 1500, 1800, 2400, 3000, 3600)
+JOINT_OVERHEAD_SECONDS = 20.0     # charged to every exposure so that very short ones are not favoured
+JOINT_ANCHORS = 10
+POOL_REFRESH_HOURS = 0.4          # how often the whole catalogue is rescanned for candidates
+# A target that will still be observable on later nights is worth less right now the further
+# it is below the altitude it reaches at transit: the same exposure will buy more of it then.
+# Its gain is scaled by (quality here / quality at transit) ** DEFER_POWER. Without this the
+# search keeps pointing low (median 34-47 deg on the official cards) at targets that pass
+# near the zenith a few hours or weeks later.
+DEFER_POWER = 5.0
+DEFER_MIN_NIGHTS = 2
 ANCHOR_POOL = 300
 CLOSED_KINDS = {"rain", "storm"}
 BLOCKING_KINDS = {"terrain_obstruction", "rocket_launch"}
@@ -269,6 +286,9 @@ class Planner:
         self._active_requests: list = []
         self._pace_cost: dict = {0: None, 1: None, 2: None}   # measured seconds per planned decision, per level
         self._pace_samples: dict = {0: [], 1: [], 2: []}
+        self._pool: list | None = None                # candidate pool, see plan()
+        self._pool_night = -1
+        self._pool_hours = 0.0
         self._pace_prev: tuple | None = None
         self._pace_planned = 0
         self._pace_night_total: float | None = None
@@ -295,6 +315,8 @@ class Planner:
             if message.get("record_type") == "bulletin" or "slot_id" in message:
                 self._note_bulletin(message)
         for message in payload.get("new_messages", []):
+            if message.get("record_type") == "state_resync":
+                self._pool = None                     # invalidated observations bring targets back
             if message.get("record_type") == "forecast":
                 self._last_forecast_notices = message.get("notices", [])
             elif message.get("record_type") == "observation_request":
@@ -411,8 +433,9 @@ class Planner:
         night_seconds = sum(max(0.0, (end - max(start, now)).total_seconds()) for start, end in state.nights if end > now)
         if self._pace_night_total is None:
             self._pace_night_total = night_seconds
+        # bright targets go first, so early exposures are short; later ones are not
         per_decision_sim = 700.0 if self._pace_planned < PACE_PROBE else \
-            max(200.0, (self._pace_night_total - night_seconds) / self._pace_planned)
+            max(700.0, (self._pace_night_total - night_seconds) / self._pace_planned)
         decisions_left = max(1.0, night_seconds / per_decision_sim)
         reserve = 60.0 + (self.llm.budget_left_seconds() if self._llm_charged and not self.llm.disabled else 0.0)
         usable = max(0.0, remaining - reserve) * 0.85
@@ -992,20 +1015,32 @@ class Planner:
             return None
         min_visible = min(MIN_VISIBLE_SECONDS, seconds_left) * SIDEREAL_DEG_PER_SECOND
 
-        still_active = []
+        # The whole catalogue is scanned only every POOL_REFRESH_HOURS: in between, the
+        # candidates can only come from the targets that were up, or about to rise, at
+        # the last scan.
+        if self._pool is None or self._pool_night != night_index or not (0.0 <= hours - self._pool_hours <= POOL_REFRESH_HOURS):
+            still_active, pool = [], []
+            rise_margin = (POOL_REFRESH_HOURS * 3600.0 + 600.0) * SIDEREAL_DEG_PER_SECOND
+            for i in state.active:
+                if self._value(i) <= 0.0:
+                    continue
+                still_active.append(i)
+                h = state.hmax[i]
+                if -h - rise_margin <= wrap180(lst - state.ra[i]) <= h:
+                    pool.append(i)
+            state.active = still_active
+            self._pool, self._pool_night, self._pool_hours = pool, night_index, hours
         candidates: list[tuple[float, int]] = []
-        for i in state.active:
+        for i in self._pool:
             v = self._value(i)
             if v <= 0.0:
                 continue
-            still_active.append(i)
             ha = wrap180(lst - state.ra[i])
             h = state.hmax[i]
             if -h <= ha <= h - min_visible:
                 nights_left = max(1, state.last_night[i] - night_index + 1)
                 setting = (1.0 + 0.5 * max(0.0, ha / h)) if h < 180 else 1.0
                 candidates.append((v * (1.0 + 2.0 / nights_left) * setting, i))
-        state.active = still_active
         if not candidates:
             return None
         candidates.sort(key=lambda t: -t[0])
@@ -1061,8 +1096,14 @@ class Planner:
             return None
         anchors.sort(key=lambda t: -t[0])
 
-        n_anchors = 1 if state.fast_level >= 1 else ANCHORS
         fibers = self.centre_fibres if state.fast_level < 2 else self.fast_fibres
+        if forced is None:
+            joint = self._joint_search(candidates, altaz, visible, moon, lst, seconds_left, fibers, night_index)
+            if joint is not None:
+                c_alt, c_az, chosen, duration = joint
+                return self._finish_plan(now, lst, c_alt, c_az, chosen, seconds_left, moon, altaz, hours,
+                                         night_index, fixed_duration=duration)
+        n_anchors = 1 if state.fast_level >= 1 else ANCHORS
         best = None  # (total, c_alt, c_az, chosen)
         tried = 0
         for _, anchor in anchors:
@@ -1124,7 +1165,157 @@ class Planner:
             self.request_exposures += 1
         return action
 
-    def _finish_plan(self, now, lst, c_alt, c_az, chosen, seconds_left, moon, altaz, hours, night_index):
+    def _joint_search(self, candidates, altaz, visible, moon, lst, seconds_left, fibers, night_index=0):
+        """Pick (pointing, fibre assignment, exposure length) together.
+
+        For every target near an anchor, its gain is tabulated for each exposure length:
+        weight x (reach^2 - done^2) -- squared, as in the rest of the planner, because only a
+        target's best single exposure counts, so half a target now is worth much less than
+        half its score -- plus the required-target bonus once it crosses the threshold. For
+        a candidate pointing each fibre then takes, per length, the best target on its
+        glass, and the pointing/length pair with the highest total gain per second wins.
+        Returns (alt, az, {fibre: (gain, target, margin)}, seconds) or None when nothing has
+        a positive rate (the caller then uses the older search, which also knows how to
+        take a probing exposure)."""
+        state, scoring, grid = self.state, self.state.scoring, self.grid
+        durations = sorted({int(max(state.min_exposure, min(state.max_exposure,
+                                                            round(base * state.duration_scale / 30.0) * 30)))
+                            for base in JOINT_DURATIONS})
+        durations = [d for d in durations if d <= seconds_left]
+        if not durations:
+            return None
+        count = len(durations)
+        per_second = [1.0 / (d + JOINT_OVERHEAD_SECONDS) for d in durations]
+        gains_cache: dict[int, list] = {}
+
+        def gains(j: int) -> list:
+            cached = gains_cache.get(j)
+            if cached is not None:
+                return cached
+            alt, az = altaz(j)
+            damp = (0.6 ** state.misses[j]) * (0.7 ** state.attempts[j]) * self._direction_factor(alt, az)
+            model = scoring.quality_model(alt, lunar_factor(moon, state.ra[j], state.dec[j], scoring.lunar_model)) or 0.0
+            k = (state.flux[j] * model * state.scale * PLAN_FACTOR_SAFETY) / scoring.f0t0
+            ha = wrap180(lst - state.ra[j])
+            up = (state.hmax[j] - ha) / SIDEREAL_DEG_PER_SECOND if state.hmax[j] < 180 else 1e9
+            f = state.factor[j]
+            done, weight = f * f, state.weight[j]
+            needs = state.required[j] and f < 0.5
+            if state.last_night[j] - night_index + 1 >= DEFER_MIN_NIGHTS:
+                best_alt = min(89.0, 90.0 - abs(state.dec[j] - state.lat))
+                best_model = scoring.quality_model(best_alt, 1.0) or 0.0
+                here = scoring.quality_model(alt, 1.0) or 0.0
+                if best_model > 0.0:
+                    damp *= min(1.0, here / best_model) ** DEFER_POWER
+            row = []
+            for d in durations:
+                if d > up or damp <= 0.0 or k <= 0.0:
+                    row.append(0.0)
+                    continue
+                reach = min(1.0, k * d)
+                value = weight * max(0.0, reach * reach - done)
+                if needs and reach >= 0.5:
+                    value += REQUIRED_BONUS
+                row.append(value * damp)
+            gains_cache[j] = row
+            return row
+
+        # anchors: the targets that pay best per second on their own, urgency included
+        seeds = []
+        for checked, (_priority, i) in enumerate(candidates):
+            if checked >= ANCHOR_POOL:
+                break
+            row = gains(i)
+            rate = max(row[ti] * per_second[ti] for ti in range(count))
+            if rate > 0.0:
+                # urgency only for targets running out of nights; no bonus for setting ones
+                nights_left = max(1, state.last_night[i] - night_index + 1)
+                seeds.append((rate * (1.0 + 2.0 / nights_left), i))
+        if not seeds:
+            return None
+        seeds.sort(key=lambda s: -s[0])
+        n_anchors = 1 if state.fast_level >= 1 else JOINT_ANCHORS
+
+        side, pitch = grid.side, grid.pitch
+        half_fov, half_glass, half_side, middle = grid.fov / 2.0, grid.glass / 2.0, grid.side / 2.0, (grid.side - 1) / 2.0
+        to_deg = 180.0 / math.pi
+        best = None  # (rate, c_alt, c_az, duration index, cells, margins)
+        for _, anchor in seeds[:n_anchors]:
+            a_alt, a_az = altaz(anchor)
+            near = [j for j in state.neighbours(state.ra[anchor], state.dec[anchor], self.neighbour_radius) if j in visible]
+            near_rows = []
+            for j in near:
+                row = gains(j)
+                if max(row) > 0.0:
+                    alt, az = altaz(j)
+                    alt, az = math.radians(alt), math.radians(az)
+                    ca = math.cos(alt)
+                    near_rows.append((j, row, ca * math.cos(az), ca * math.sin(az), math.sin(alt),
+                                      self.edge_margin * (1 + 1.5 * state.misses[j])))
+            for fiber in fibers:
+                d_north, d_east = grid.fiber_center(fiber)
+                c_alt, c_az = shift_altaz(a_alt, a_az, -d_north, -d_east)
+                if not (state.min_alt + 1.5 <= c_alt <= 89.0):
+                    continue
+                c_alt = round(c_alt, 4)
+                c_az = round(c_az, 4) % 360.0
+                c_ra, c_dec = altaz_to_radec(c_alt, c_az, lst, state.lat)
+                c_hmax = max_hour_angle_deg(c_dec, state.lat, state.min_alt + 0.3)
+                centre_up = (c_hmax - wrap180(lst - c_ra)) / SIDEREAL_DEG_PER_SECOND if c_hmax < 180 else 1e9
+                cells: dict[int, tuple[list, list]] = {}   # fibre -> (best gain per length, target per length)
+                margins: dict[int, float] = {}
+                # same gnomonic projection and fibre lookup as geometry.tangent_offsets /
+                # FiberGrid.classify, with the centre's basis vectors computed once
+                calt, caz = math.radians(c_alt), math.radians(c_az)
+                s_alt, c_cos, s_az, c_az_cos = math.sin(calt), math.cos(calt), math.sin(caz), math.cos(caz)
+                cx, cy, cz = c_cos * c_az_cos, c_cos * s_az, s_alt
+                nx, ny, nz = -s_alt * c_az_cos, -s_alt * s_az, c_cos
+                ex, ey = -s_az, c_az_cos
+                for j, row, tx, ty, tz, keep_clear in near_rows:
+                    depth = tx * cx + ty * cy + tz * cz
+                    if depth <= 0.0:
+                        continue
+                    d_n = to_deg * (tx * nx + ty * ny + tz * nz) / depth
+                    d_e = to_deg * (tx * ex + ty * ey) / depth
+                    if abs(d_n) > half_fov or abs(d_e) > half_fov:
+                        continue
+                    r_i = min(max(int(math.floor(d_n / pitch + half_side)), 0), side - 1)
+                    c_i = min(max(int(math.floor(d_e / pitch + half_side)), 0), side - 1)
+                    margin = half_glass - max(abs(d_n - (r_i - middle) * pitch), abs(d_e - (c_i - middle) * pitch))
+                    if margin < 0.0:
+                        continue
+                    fib = r_i * side + c_i
+                    edge = 1.0 if margin >= keep_clear else 0.4
+                    cell = cells.get(fib)
+                    if cell is None:
+                        cell = cells[fib] = ([0.0] * count, [-1] * count)
+                    values, owners = cell
+                    for ti in range(count):
+                        v = row[ti] * edge
+                        if v > values[ti]:
+                            values[ti] = v
+                            owners[ti] = j
+                    margins[j] = margin
+                if not cells:
+                    continue
+                for ti in range(count):
+                    if durations[ti] > centre_up:
+                        break
+                    total = 0.0
+                    for values, _owners in cells.values():
+                        total += values[ti]
+                    rate = total * per_second[ti]
+                    if best is None or rate > best[0]:
+                        best = (rate, c_alt, c_az, ti, cells, margins)
+        if best is None or best[0] <= 0.0:
+            return None
+        _, c_alt, c_az, ti, cells, margins = best
+        chosen = {fib: (values[ti], owners[ti], margins[owners[ti]])
+                  for fib, (values, owners) in cells.items() if owners[ti] >= 0}
+        return (c_alt, c_az, chosen, durations[ti]) if chosen else None
+
+    def _finish_plan(self, now, lst, c_alt, c_az, chosen, seconds_left, moon, altaz, hours, night_index,
+                     fixed_duration=None):
         state = self.state
         scoring = state.scoring
         c_ra, c_dec = altaz_to_radec(c_alt, c_az, lst, state.lat)
@@ -1147,7 +1338,7 @@ class Planner:
         forced_best = None  # (rate, duration): best candidate that completes the pursued request target
         request_best = None  # (rate, duration): best candidate that also clears a needed
                               # request target's completion_factor_threshold
-        for base in DURATIONS:
+        for base in (DURATIONS if fixed_duration is None else ()):
             duration = round((base * state.duration_scale) / 30.0) * 30
             duration = int(max(state.min_exposure, min(state.max_exposure, duration)))
             if duration > seconds_left or duration > center_up:
@@ -1175,6 +1366,8 @@ class Planner:
                     and min(1.0, item["k"] * duration) >= min(1.0, forced[1] * REQUEST_MARGIN)
                     for item in info.values()) and (forced_best is None or rate > forced_best[0]):
                 forced_best = (rate, duration)
+        if fixed_duration is not None:
+            best = (1.0, fixed_duration)      # already chosen together with the fibres (_joint_search)
         if forced is not None:
             if forced_best is None:
                 return None
