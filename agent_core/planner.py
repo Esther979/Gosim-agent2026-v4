@@ -11,13 +11,11 @@ program -- or wait / report / finish.
    (DARK / BRIGHT / BACKUP) most assigned targets will match.
 
 Everything here uses only the public catalogue, the public scoring config, and the
-agent's own past hits (SurveyState) -- never hidden weather truth. Once per night, one
-LLM call (see `_night_advice` below) reads the forecast, the live bulletin and the
-survey's own progress, and answers with BOUNDED knobs only: an exposure bias in 0.9-1.1
-and whether to lean towards observation requests (plus a sky outlook that is logged).
-Direction avoidance and per-class weights were tried as model outputs and removed after
-a replay ablation showed them to cost points. Required targets and instrument-fault
-reports never go through the model. A failed call means neutral advice (= the rule-based path) for that
+agent's own past hits (SurveyState) -- never hidden weather truth. The model has two jobs,
+both with bounded outputs. It reads every weekly forecast (`_on_forecast`) and turns the
+event list into an expected usable fraction per night, which decides what cannot wait
+for a better night. And it arbitrates borderline instrument-fault alarms (`_arbitrate`).
+Clear-cut fault reports and the pointing search itself never go through the model. A failed call means neutral advice (= the rule-based path) for that
 night; the next night's call still runs normally.
 
 This mirrors the anchor-search algorithm of this project's companion TypeScript
@@ -43,7 +41,7 @@ from .geometry import (
     wrap180,
 )
 from .llm_client import LLMClient
-from .memory import AdviceTape, TraceLog
+from .memory import TraceLog
 from .state import PendingPrediction
 
 REQUIRED_BONUS = 60.0
@@ -182,57 +180,37 @@ def _az_distance(a: float, b: float) -> float:
     return abs(wrap180(a - b))
 
 
-CLASSES = ("QSO", "ELG", "LRG", "BGS", "Star")
-OUTLOOKS = ("good", "degraded", "closed")
-EXPOSURE_BIAS_RANGE = (0.9, 1.1)
-# Skip the nightly call when it could not finish anyway, or when the wall clock is
-# getting short enough that the deterministic search should keep all of it. Both wall-clock
-# figures are fractions of the card's own limit (250 s and 500 s on a 900 s card), so a
-# card with a shorter limit still gets its share of model calls. The deterministic part
-# needs well under 100 s, so 500 s of model time fits even if waiting on the model is
-# charged against the limit.
-ADVICE_MIN_LLM_BUDGET_SECONDS = 30.0
 PACE_PROBE = 40                     # planned decisions run at full depth before the pace is set
-# A survey can have far more nights than the budget has calls (a year-long card would spend
-# everything in the first two months). On such a card the nightly call is made only on
-# nights that have something to decide -- a forecast or bulletin notice, or an open
-# request -- and never faster than the budget lasts: at night n of N at most the share
-# n/N of the advice budget (plus a little slack) may be spent. The rest is kept for fault
-# arbitration.
-ADVICE_SECONDS_PER_CALL = 9.0
-ADVICE_BUDGET_SHARE = 0.85
-ADVICE_PACING_SLACK_SECONDS = 45.0
-ADVICE_MIN_WALLCLOCK_FRACTION = 250.0 / 900.0
-LLM_BUDGET_FRACTION = 500.0 / 900.0
+LLM_BUDGET_FRACTION = 500.0 / 900.0   # of the card's wall-clock limit; the deterministic part needs far less
+# The model reads every weekly forecast once (see _on_forecast) and turns it into an
+# expected usable fraction for each night it covers. A share of the budget is kept back for
+# fault arbitration; a forecast that arrives when less than that is left is read by rule.
+OUTLOOK_RESERVE_SECONDS = 60.0
+OUTLOOK_MIN_WALLCLOCK_FRACTION = 150.0 / 900.0
+OUTLOOK_LOST_NIGHT = 0.3            # a night expected to be less usable than this is not counted on
+CLOSING_KINDS = ("rain|ALL", "storm|ALL")   # the only prior the rule has; everything else is learned
 
-ADVICE_SYSTEM_PROMPT = (
-    "You advise a robotic multi-fibre telescope survey once at the start of each night. "
-    "You are given tonight's forecast notices, the next three nights' forecast, the live "
-    "bulletin, the hit rate so far, per-class progress (done_weight / total_weight of "
-    "science weight), how many required targets remain, active observation requests and "
-    "your remaining time budget. Reply with exactly one JSON object and nothing else:\n"
-    '{"sky_outlook": "good|degraded|closed", "exposure_bias": 1.0, '
-    '"pursue_requests": true, "notes": "<=120 chars"}\n'
-    "Rules: exposure_bias is within 0.9-1.1 (above 1 = slightly longer exposures when the "
-    "sky looks poor tonight, below 1 = slightly shorter when it looks excellent; 1.0 = no "
-    "change). sky_outlook describes the whole night. pursue_requests=false only if "
-    "chasing the active requests is clearly not worth it. Pointing directions, target "
-    "choice, required targets and instrument-fault reports are handled by fixed rules "
-    "and are not affected by anything you answer. Values outside the stated range are "
-    "clamped. Answer quickly; do not deliberate at length."
+OUTLOOK_SYSTEM_PROMPT = (
+    "You plan a robotic telescope survey. A weekly forecast has just arrived: a list of "
+    "events, each with a kind, a compass direction (or ALL for the whole sky) and the "
+    "nights it is expected on. For every night in `nights`, estimate `usable`: the "
+    "fraction of that night (0.0-1.0) in which exposures will return useful data. The "
+    "scheduler uses it to decide what cannot wait: targets and time-limited requests "
+    "whose remaining nights are mostly unusable are observed now, even at low altitude, "
+    "instead of being left for a better moment that will not come.\n"
+    "Evidence: `experience` gives, for each event kind and scope already met in this "
+    "survey, how many nights it was forecast for and the usable fraction those nights "
+    "really had (`quiet` = nights with no forecast event). Trust it over intuition once a "
+    "kind has a few nights; for kinds not yet met, reason from what the event is -- rain "
+    "or a storm over the whole sky closes the dome, a directional event blocks part of "
+    "the sky, haze and cold snaps degrade rather than close, a rocket launch is a short "
+    "local closure. Several events on one night combine. Nights without events are quiet. "
+    "`rule_estimate` is what a fixed table would say; depart from it when the evidence "
+    "or the combination of events justifies it.\n"
+    'Reply with exactly one JSON object and nothing else: {"usable": {"YYYY-MM-DD": '
+    'number, ...}, "notes": "<=120 chars"} with one entry per night in `nights`. '
+    "Answer quickly."
 )
-
-
-def _clamped(value, low: float, high: float, default: float = 1.0) -> float:
-    if isinstance(value, bool):
-        return default
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        return default
-    if number != number:  # NaN
-        return default
-    return min(high, max(low, number))
 
 
 class Planner:
@@ -253,13 +231,21 @@ class Planner:
         self.llm = LLMClient(log=log)
         self.llm.total_budget_seconds = min(self.llm.total_budget_seconds,
                                             LLM_BUDGET_FRACTION * state.wallclock_limit)
-        self.advice_budget = ADVICE_BUDGET_SHARE * self.llm.total_budget_seconds
-        self.advice_sparse = len(state.nights) * ADVICE_SECONDS_PER_CALL > self.advice_budget
-        log(f"planner: wall-clock limit {state.wallclock_limit:.0f}s, llm budget {self.llm.total_budget_seconds:.0f}s, "
-            f"advice {'only on eventful nights, paced' if self.advice_sparse else 'every night'}; "
+        log(f"planner: wall-clock limit {state.wallclock_limit:.0f}s, llm budget {self.llm.total_budget_seconds:.0f}s; "
             f"fibres {self.grid.side}x{self.grid.side}, centres tried {len(self.centre_fibres)}")
         self.trace = TraceLog(log=log)
-        self.tape = AdviceTape(log=log)
+        # Forecast outlook (see _on_forecast): expected usable fraction of every night, 1.0
+        # until a forecast says otherwise, and its running sum for "usable nights left".
+        self._night_dates = [(start - timedelta(hours=12)).date().isoformat() for start, _end in state.nights]
+        self._night_of_date = {date: n for n, date in enumerate(self._night_dates)}
+        self._usable = [1.0] * len(state.nights)
+        self._usable_prefix = list(range(len(state.nights) + 1))
+        self._forecast_keys: dict = {}                # night index -> {"kind|ALL" or "kind|DIR"} forecast for it
+        self._kind_stats: dict = {}                   # key -> [sum of usable fractions actually seen, nights]
+        self._night_good: dict = {}                   # night index -> seconds of exposures that returned data
+        self._last_observe: tuple | None = None       # (night index, seconds) of the previous action, if an exposure
+        self._defer_power = DEFER_POWER
+        self.outlook_calls = 0
 
         self.observe_count = 0
         self.reports = 0
@@ -288,7 +274,6 @@ class Planner:
         self.total_hit = 0
         self._current_action_index = None
         self._request_thresholds_now: dict = {}
-        self.pursue_requests = True
         self._active_requests: list = []
         self._pace_cost: dict = {0: None, 1: None, 2: None}   # measured seconds per planned decision, per level
         self._pace_samples: dict = {0: [], 1: [], 2: []}
@@ -327,6 +312,7 @@ class Planner:
                 self._pool = None                     # invalidated observations bring targets back
             if message.get("record_type") == "forecast":
                 self._last_forecast_notices = message.get("notices", [])
+                self._on_forecast(message, payload)
             elif message.get("record_type") == "observation_request":
                 self.log(f"planner: observation request {message.get('request_id')} issued, "
                          f"{len(message.get('target_ids', []))} targets by {message.get('deadline_utc')}")
@@ -343,6 +329,12 @@ class Planner:
         self._current_action_index = payload.get("observe_action_index")
         self._active_requests = payload.get("active_requests") or []
         self._hours_now = hours
+        if self._last_observe is not None:
+            observed_night, seconds = self._last_observe
+            self._last_observe = None
+            if last_result and last_result.get("action") == "observe" and \
+                    any(float(h.get("score", 0.0)) > 0.0 for h in last_result.get("hits", [])):
+                self._night_good[observed_night] = self._night_good.get(observed_night, 0) + seconds
         if self._last_forced is not None:
             request_id, forced_index = self._last_forced
             self._last_forced = None
@@ -369,9 +361,10 @@ class Planner:
 
         if self.night_index_seen != night_index:
             self.night_index_seen = night_index
-            self._night_advice(night_index, night_start, now, payload)
-            # pursue_requests may just have changed for tonight
-            self._request_thresholds_now = self._request_thresholds(payload.get("active_requests") or [])
+            # how much the coming nights can be counted on sets how patiently tonight waits
+            # for targets to climb: with the next three nights lost, almost not at all
+            ahead = self._usable[night_index + 1:night_index + 4]
+            self._defer_power = DEFER_POWER * (0.3 + 0.7 * (sum(ahead) / len(ahead) if ahead else 1.0))
 
         if (night_end - now).total_seconds() < state.min_exposure:
             nxt = state.next_night_start(now)
@@ -392,6 +385,7 @@ class Planner:
             return {"action": "wait", "duration_seconds": self._to_next_slot(now, night_start),
                     "reason": "nothing useful is up"}
         self.observe_count += 1
+        self._last_observe = (night_index, int(action["duration_seconds"]))
         action["reason"] = f"{len(action['assignments'])} fibres, program {action['program']}"
         return action
 
@@ -458,109 +452,126 @@ class Planner:
             state.fast_level = level
         self._pace_prev = (elapsed, level, False, self.llm.spent_seconds)
 
-    # -- LLM: one bounded call per night ------------------------------------------
+    # -- LLM: reading the weekly forecast -----------------------------------------------
+    #
+    # A forecast lists events (kind, direction or ALL, nights) for the week ahead. What the
+    # scheduler needs from it is one number per night: how much of that night can be counted
+    # on. The model turns the event list into those numbers, using both what the events
+    # mean and what the same kinds of event have actually done on this card so far; the
+    # numbers then decide which targets and requests are "now or never" (see _joint_search,
+    # _request_reachable_later, and the nightly defer power in decide). Without a model
+    # answer a fixed rule supplies them, so the look-ahead never switches off.
+
+    def _rule_usable(self, night: int) -> float:
+        """What the events forecast for a night are worth without a model: the usable
+        fraction each kind has really shown on this card (relative to quiet nights) once
+        it has been met three times, and until then 0.1 for rain or a storm over the
+        whole sky and 1.0 for everything else. The worst event of the night counts."""
+        keys = self._forecast_keys.get(night)
+        if not keys:
+            return 1.0
+        quiet = self._kind_stats.get("quiet")
+        quiet_level = quiet[0] / quiet[1] if quiet and quiet[1] >= 3 and quiet[0] > 0 else None
+        worst = 1.0
+        for key in keys:
+            seen = self._kind_stats.get(key)
+            if seen and seen[1] >= 3:
+                value = seen[0] / seen[1]
+                if quiet_level:
+                    value = min(1.0, value / quiet_level)
+            else:
+                value = 0.1 if key in CLOSING_KINDS else 1.0
+            worst = min(worst, value)
+        return worst
 
     @staticmethod
-    def _sanitize_advice(answer) -> dict:
-        """Turn whatever the model returned into bounded advice. Anything missing,
-        malformed or out of range becomes neutral, so the worst a bad reply can do is
-        nothing. Returns {"ok", "sky_outlook", "exposure_bias", "pursue_requests",
-        "notes"}; ok=False means the reply was unusable as a whole. Keys the interface
-        does not have (e.g. directions to avoid) are ignored."""
-        advice = {"ok": False, "sky_outlook": "unknown", "exposure_bias": 1.0,
-                  "pursue_requests": True, "notes": ""}
-        if not isinstance(answer, dict):
-            return advice
-        advice["ok"] = True
-        outlook = str(answer.get("sky_outlook", "")).strip().lower()
-        if outlook in OUTLOOKS:
-            advice["sky_outlook"] = outlook
-        advice["exposure_bias"] = _clamped(answer.get("exposure_bias", 1.0), *EXPOSURE_BIAS_RANGE)
-        if isinstance(answer.get("pursue_requests"), bool):
-            advice["pursue_requests"] = answer["pursue_requests"]
-        advice["notes"] = str(answer.get("notes") or "")[:120]
-        return advice
+    def _sanitize_outlook(answer, dates: list, rule: dict) -> tuple[dict, int]:
+        """Model reply -> {date: usable in [0, 1]} for exactly the nights asked about.
+        Any night the reply leaves out or garbles keeps the rule's value. Returns the
+        result and how many nights the model actually supplied."""
+        supplied = answer.get("usable") if isinstance(answer, dict) else None
+        result, taken = {}, 0
+        for date in dates:
+            value = supplied.get(date) if isinstance(supplied, dict) else None
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or value != value:
+                result[date] = rule[date]
+            else:
+                result[date] = min(1.0, max(0.0, float(value)))
+                taken += 1
+        return result, taken
 
-    def _progress_by_class(self) -> dict:
+    def _on_forecast(self, forecast: dict, payload: dict) -> None:
         state = self.state
-        progress = {name: {"done_weight": 0.0, "total_weight": 0.0} for name in CLASSES}
-        for i, name in enumerate(state.target_class):
-            entry = progress.get(name)
-            if entry is None:
+        try:
+            first = parse_utc(forecast["coverage_start_utc"])
+            last = parse_utc(forecast["coverage_end_utc"])
+        except (KeyError, TypeError, ValueError):
+            return
+        covered = [n for n, (start, _end) in enumerate(state.nights) if first <= start < last]
+        for n in covered:
+            self._forecast_keys[n] = set()             # a newer forecast replaces an older one for the same night
+        for notice in forecast.get("notices") or []:
+            kind, direction = notice.get("event_kind"), notice.get("direction")
+            if not kind:
                 continue
-            entry["total_weight"] += state.weight[i]
-            if state.factor[i] >= 0.5:
-                entry["done_weight"] += state.weight[i]
-        return {name: {k: round(v, 1) for k, v in entry.items()} for name, entry in progress.items()}
-
-    def _night_advice(self, night_index: int, night_start, now, payload: dict) -> None:
-        """One planning question at the start of each night. The answer is sanitized into
-        bounded knobs (_sanitize_advice) and applied for the rest of the night:
-        state.duration_scale and self.pursue_requests.
-        sky_outlook is only logged for now."""
-        state = self.state
-        night_date = (night_start - timedelta(hours=12)).date().isoformat()
+            key = f"{kind}|{'ALL' if direction == 'ALL' else 'DIR'}"
+            for date in notice.get("nights") or []:
+                n = self._night_of_date.get(date)
+                if n is not None:
+                    self._forecast_keys.setdefault(n, set()).add(key)
+                    if n not in covered:
+                        covered.append(n)
+        covered.sort()
+        if not covered:
+            return
+        dates = [self._night_dates[n] for n in covered]
+        rule = {self._night_dates[n]: round(self._rule_usable(n), 2) for n in covered}
+        eventful = any(self._forecast_keys.get(n) for n in covered)
         left = float((payload.get("wallclock") or {}).get("remaining_seconds", 0))
-
-        next_dates = {(night_start - timedelta(hours=12) + timedelta(days=d)).date().isoformat() for d in (1, 2, 3)}
-        forecast_tonight = [n for n in self._last_forecast_notices if night_date in (n.get("nights") or [])]
-        forecast_next = [n for n in self._last_forecast_notices if next_dates & set(n.get("nights") or [])]
-        bulletin_notices = (payload.get("latest_bulletin") or {}).get("notices", [])
-        hit_rate = (self.total_hit / self.total_assigned) if self.total_assigned > 0 else 1.0
-        threshold = state.scoring.required_threshold
-        requests = []
-        for request in payload.get("active_requests") or []:
-            try:
-                hours_left = round((parse_utc(request["deadline_utc"]) - now).total_seconds() / 3600.0, 1)
-            except (KeyError, TypeError, ValueError):
-                hours_left = None
-            requests.append({"request_id": request.get("request_id"),
-                             "remaining_count": request.get("remaining_count"),
-                             "hours_left": hours_left})
-        user_payload = {
-            "night_date": night_date,
-            "nights_remaining": len(state.nights) - night_index,
-            "forecast_notices_for_tonight": forecast_tonight,
-            "forecast_notices_next_3_nights": forecast_next,
-            "current_bulletin_notices": bulletin_notices,
-            "hit_rate_so_far": round(hit_rate, 3),
-            "progress_by_class": self._progress_by_class(),
-            "required_remaining": sum(1 for i in range(len(state.ids))
-                                      if state.required[i] and state.factor[i] < threshold),
-            "active_requests": requests,
-            "llm_budget_left_seconds": round(self.llm.budget_left_seconds()),
-        }
-        if self.tape.replaying:
-            advice = self._sanitize_advice(self.tape.replay(night_date))
-            neutral = self._sanitize_advice(None)
-            for knob, key in (("exposure_bias", "exposure_bias"), ("pursue", "pursue_requests")):
-                if knob in self.tape.masked:
-                    advice[key] = neutral[key]
-            status = "replay"
+        status, taken, usable = "rule", 0, dict(rule)
+        if not eventful:
+            status = "quiet"                           # nothing to interpret
         elif self.llm.disabled:
-            advice, status = self._sanitize_advice(None), "disabled"
-        elif self.llm.budget_left_seconds() < ADVICE_MIN_LLM_BUDGET_SECONDS or left < ADVICE_MIN_WALLCLOCK_FRACTION * state.wallclock_limit:
-            advice, status = self._sanitize_advice(None), "skipped"
-        elif self.advice_sparse and not (forecast_tonight or bulletin_notices or requests):
-            advice, status = self._sanitize_advice(None), "quiet"       # nothing to decide tonight
-        elif self.advice_sparse and self.llm.spent_seconds > ADVICE_PACING_SLACK_SECONDS + \
-                self.advice_budget * (night_index + 1) / max(1, len(state.nights)):
-            advice, status = self._sanitize_advice(None), "paced"       # ahead of the budget's pace
+            status = "disabled"
+        elif self.llm.budget_left_seconds() < OUTLOOK_RESERVE_SECONDS + self.llm.call_timeout_seconds \
+                or left < OUTLOOK_MIN_WALLCLOCK_FRACTION * state.wallclock_limit:
+            status = "skipped"
         else:
-            advice = self._sanitize_advice(self.llm.ask_json(ADVICE_SYSTEM_PROMPT, user_payload, left))
-            status = "ok" if advice["ok"] else "fell back"
-        self.tape.record(night_date, {"sky_outlook": advice["sky_outlook"],
-                                      "exposure_bias": advice["exposure_bias"],
-                                      "pursue_requests": advice["pursue_requests"], "notes": advice["notes"]})
+            experience = {key: {"nights": count, "usable_fraction": round(total / count, 2)}
+                          for key, (total, count) in sorted(self._kind_stats.items()) if count}
+            answer = self.llm.ask_json(OUTLOOK_SYSTEM_PROMPT, {
+                "nights": dates,
+                "forecast_notices": forecast.get("notices") or [],
+                "experience": experience,
+                "rule_estimate": rule,
+                "nights_left_in_survey": len(state.nights) - covered[0],
+            }, left)
+            self.outlook_calls += 1
+            usable, taken = self._sanitize_outlook(answer, dates, rule)
+            status = "ok" if taken else "fell back"
+        for n in covered:
+            self._usable[n] = usable[self._night_dates[n]]
+        total, prefix = 0.0, [0.0]
+        for value in self._usable:
+            total += value
+            prefix.append(total)
+        self._usable_prefix = prefix
+        if eventful:
+            self.log(f"planner: forecast outlook {status} " + " ".join(
+                f"{self._night_dates[n][5:]}:{self._usable[n]:.2f}" + (f"(rule {rule[self._night_dates[n]]:.2f})"
+                                                                         if abs(self._usable[n] - rule[self._night_dates[n]]) >= 0.05 else "")
+                for n in covered))
+        self.trace.write({"event": "forecast_outlook", "status": status, "usable": usable, "rule": rule})
 
-        state.duration_scale = advice["exposure_bias"]
-        self.pursue_requests = advice["pursue_requests"]
-        if status not in ("quiet", "paced") or not self.advice_sparse:   # a year of "quiet" lines would drown the log
-            self.log(f"planner: night {night_date} llm advice {status} bias={advice['exposure_bias']:.2f} "
-                     f"pursue={advice['pursue_requests']} outlook={advice['sky_outlook']}")
-        self.trace.write({"event": "night_advice", "night_date": night_date, "status": status,
-                          "exposure_bias": advice["exposure_bias"], "pursue_requests": advice["pursue_requests"],
-                          "sky_outlook": advice["sky_outlook"], "notes": advice["notes"]})
+    def _close_outlook_night(self, night: int) -> None:
+        """Book what a finished night was really worth under the event kinds forecast for
+        it, so that later forecasts are read against this card's own record."""
+        start, end = self.state.nights[night]
+        fraction = min(1.0, self._night_good.pop(night, 0) / max(1.0, (end - start).total_seconds()))
+        for key in (self._forecast_keys.get(night) or {"quiet"}):
+            seen = self._kind_stats.setdefault(key, [0.0, 0])
+            seen[0] += fraction
+            seen[1] += 1
 
     # -- instrument fault reporting -------------------------------------------------
     #
@@ -700,6 +711,7 @@ class Planner:
             self._settle_report(bool(last_result.get("correct")), payload)
         if self._fault_open_night is not None and night_index != self._fault_open_night:
             self._close_fault_night(self._fault_open_night, payload)
+            self._close_outlook_night(self._fault_open_night)
             self._fault_open_night = None
         if night_index is not None and self._fault_open_night is None:
             self._fault_open_night = night_index
@@ -817,7 +829,7 @@ class Planner:
             self._report_due = f"rule (borderline, {len(run)} nights): {summary}"
             return
         verdict = None
-        if not self.llm.disabled and not self.tape.replaying and self._llm_waits < FAULT_MAX_LLM_WAITS:
+        if not self.llm.disabled and self._llm_waits < FAULT_MAX_LLM_WAITS:
             verdict = self._arbitrate(payload)
         if verdict == "report":
             self._report_due = f"model: borderline, {summary}"
@@ -902,8 +914,6 @@ class Planner:
         runs once request targets happen to already be among its assigned fibres."""
         state = self.state
         thresholds: dict[int, float] = {}
-        if not self.pursue_requests:
-            return thresholds
         for request in active_requests:
             if int(request.get("remaining_count", 0)) <= 0:
                 continue
@@ -956,6 +966,7 @@ class Planner:
         if ha < 0.0 and (-ha - min(h, -ha)) / SIDEREAL_DEG_PER_SECOND + REQUEST_MAX_SECONDS < seconds_left:
             return True                              # still east of the meridian with time left tonight
         return any(start < deadline and state.first_night[i] <= n <= state.last_night[i]
+                   and self._usable[n] >= OUTLOOK_LOST_NIGHT        # a night forecast lost is not "later"
                    for n, (start, _end) in enumerate(state.nights) if n > night_index)
 
     def _pick_request_target(self, now, lst: float, moon, seconds_left: float, night_index: int):
@@ -1195,6 +1206,9 @@ class Planner:
         count = len(durations)
         per_second = [1.0 / (d + JOINT_OVERHEAD_SECONDS) for d in durations]
         gains_cache: dict[int, list] = {}
+        prefix, defer_power = self._usable_prefix, self._defer_power
+        usable_before = prefix[night_index]          # tonight counts in full: it is being used right now
+        usable_before -= 1.0 - self._usable[night_index]
 
         def gains(j: int) -> list:
             cached = gains_cache.get(j)
@@ -1209,12 +1223,12 @@ class Planner:
             f = state.factor[j]
             weight = state.weight[j]
             needs = state.required[j] and f < 0.5
-            if state.last_night[j] - night_index + 1 >= DEFER_MIN_NIGHTS:
+            if prefix[state.last_night[j] + 1] - usable_before >= DEFER_MIN_NIGHTS - 0.5:
                 best_alt = min(89.0, 90.0 - abs(state.dec[j] - state.lat))
                 best_model = scoring.quality_model(best_alt, 1.0) or 0.0
                 here = scoring.quality_model(alt, 1.0) or 0.0
                 if best_model > 0.0:
-                    damp *= min(1.0, here / best_model) ** DEFER_POWER
+                    damp *= min(1.0, here / best_model) ** defer_power
             ceiling = max(1e-6, min(1.0, k * min(state.max_exposure, up)))
             row = []
             for d in durations:
@@ -1242,7 +1256,7 @@ class Planner:
             rate = max(row[ti] * per_second[ti] for ti in range(count))
             if rate > 0.0:
                 # urgency only for targets running out of nights; no bonus for setting ones
-                nights_left = max(1, state.last_night[i] - night_index + 1)
+                nights_left = max(0.5, prefix[state.last_night[i] + 1] - usable_before)   # usable ones, per the forecast
                 seeds.append((rate * (1.0 + 2.0 / nights_left), i))
         if not seeds:
             return None
@@ -1478,33 +1492,25 @@ class Planner:
 
 
 if __name__ == "__main__":
-    # Self-test for the advice sanitizer: python3 -m agent_core.planner
-    clean = Planner._sanitize_advice
-    neutral = {"ok": False, "sky_outlook": "unknown", "exposure_bias": 1.0, "pursue_requests": True, "notes": ""}
-
-    # 1. out-of-range bias is clamped, both ends
-    assert clean({"exposure_bias": 1.4})["exposure_bias"] == 1.1
-    assert clean({"exposure_bias": 0.2})["exposure_bias"] == 0.9
-
-    # 2. unusable reply -> neutral
-    for bad in (None, "not json", [], 3):
-        assert clean(bad) == neutral, clean(bad)
-
-    # 3. wrong types inside an object -> that knob neutral, reply still counts
-    a = clean({"exposure_bias": "nan", "pursue_requests": "no", "sky_outlook": 7})
-    assert a == {**neutral, "ok": True}, a
-    assert clean({"exposure_bias": True})["exposure_bias"] == 1.0
-
-    # 4. knobs the interface no longer has are ignored, never applied
-    a = clean({"sky_outlook": "closed", "avoid_directions": ["N", "NE", "E", "SE", "S", "SW", "W", "NW"],
-               "class_weights": {"QSO": 3.0}, "duration_scale": 0.7, "pursue_requests": False})
-    assert a == {"ok": True, "sky_outlook": "closed", "exposure_bias": 1.0, "pursue_requests": False, "notes": ""}, a
-
-    # 5. a normal reply passes through
-    a = clean({"sky_outlook": "Degraded", "exposure_bias": "1.05", "pursue_requests": True, "notes": "x" * 300})
-    assert a["ok"] and a["sky_outlook"] == "degraded" and a["exposure_bias"] == 1.05 and a["pursue_requests"], a
-    assert len(a["notes"]) == 120, a
-    print("planner self-test: _sanitize_advice OK (5 cases)")
+    # Self-tests: python3 -m agent_core.planner
+    dates = ["2027-06-01", "2027-06-02", "2027-06-03"]
+    rule = {"2027-06-01": 1.0, "2027-06-02": 0.1, "2027-06-03": 1.0}
+    outlook = Planner._sanitize_outlook
+    # 1. unusable reply -> the rule, nothing taken from the model
+    for bad in (None, "not json", [], 3, {"usable": "all good"}, {"notes": "x"}):
+        assert outlook(bad, dates, rule) == (rule, 0), bad
+    # 2. values are clamped to [0, 1]
+    assert outlook({"usable": {"2027-06-01": 1.7, "2027-06-02": -3, "2027-06-03": 0.4}}, dates, rule) == \
+        ({"2027-06-01": 1.0, "2027-06-02": 0.0, "2027-06-03": 0.4}, 3)
+    # 3. a night left out, or given as something that is not a number, keeps the rule's value
+    assert outlook({"usable": {"2027-06-01": 0.8, "2027-06-03": "bad", "2027-06-02": True}}, dates, rule) == \
+        ({"2027-06-01": 0.8, "2027-06-02": 0.1, "2027-06-03": 1.0}, 1)
+    # 4. nights that were not asked about are ignored
+    assert outlook({"usable": {"2027-07-09": 0.0, "2027-06-02": 0.25}}, dates, rule) == \
+        ({"2027-06-01": 1.0, "2027-06-02": 0.25, "2027-06-03": 1.0}, 1)
+    # 5. NaN is not a number
+    assert outlook({"usable": {"2027-06-01": float("nan")}}, dates, rule) == (rule, 0)
+    print("planner self-test: _sanitize_outlook OK (5 cases)")
 
     def night(ratio):
         return {"ratio": ratio}
