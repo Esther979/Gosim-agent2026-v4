@@ -1,12 +1,11 @@
 # python-agent -- an example agent for participant-agent-protocol-v4
 
-> Integration branch, 2026-10-05: based on `origin/LLM` at `d1d51da`, not `main`.
+> Branch `codex/llm-weather-incremental-score`, based on `origin/LLM` at `d1d51da`.
 > The actual inherited LLM stages are weekly forecast interpretation and borderline
 > fault arbitration; the historical nightly-call description below is superseded.
 
-The default preserves the teammate strategy with a cached spatial index. Enable
-both `AGENT_CONDITIONS=quality` and `AGENT_SCORE_GAIN=1` to try the transferred
-candidate: frozen public-input ridge quality estimates and actual best-score
+The project manifest enables `AGENT_CONDITIONS=quality` and `AGENT_SCORE_GAIN=1`
+to reproduce the evaluated candidate: frozen public-input ridge quality estimates and actual best-score
 increments. It preserves the joint scheduler, sky-band estimator and fault detector.
 The quality proxy uses a representative 900-second duration, not a future rollout.
 Use `LLM_DISABLED=1` for API-free numerical comparisons. Set conditions to `off` and
@@ -26,8 +25,36 @@ all four scores on rerun. Each live policy/card was run once with independent mo
 responses. OOF excludes weather training data, not scheduler development decisions.
 28 automated tests and 16 inherited planner self-checks pass. Fault arbitration is
 conditional; successful execution of both LLM stages on every card is not established.
-The separately packaged candidate enables both flags in its project manifest; this
-repository keeps the original policy as the default. No remote push or submission.
+Both `observer.project.json` and `.env.example` use the evaluated settings:
+`AGENT_CONDITIONS=quality`, `AGENT_SCORE_GAIN=1`, `LLM_MAX_CALLS=6`,
+`LLM_TOTAL_BUDGET_SECONDS=180`, and `LLM_MAX_RETRIES=0`.
+Direct local runs do not read the project manifest: copy `.env.example` to `.env`
+only if no `.env` exists, or add these five settings to your existing local file.
+Without explicit variables the Python fallback defaults retain the original policy.
+
+The candidate completed one online A-D evaluation, batch
+`7777491a-d1e2-43b7-b594-9359855df716`, with Kimi `k3`:
+
+| Card | LLM_agent_v4_Jingmeng | This candidate | Difference | Required missing, original / candidate | Candidate charged CPU (s) |
+|---|---:|---:|---:|---:|---:|
+| A | 23512.19 | 23602.56 | +90.37 | 1 / 2 | 391.254 |
+| B | 38928.46 | 39174.26 | +245.80 | 0 / 0 | 483.397 |
+| C | 25230.41 | 24919.78 | -310.63 | 0 / 0 | 526.576 |
+| D | 31459.16 | 32226.43 | +767.28 | 2 / 3 | 252.561 |
+| Mean | 29782.55 | 29980.76 | +198.20 (+0.67%) | | |
+
+All candidate cards ended with `survey_complete`; 22 of 24 time-limited requests
+completed, the same count as the comparison. The comparison batch is
+`a7f11a22-8c42-4117-9d57-a7aadbdbe5a5`; scenario hashes match per card.
+This is one run per version, with different LLM budgets (24 attempts here versus
+87 in the comparison), so the difference cannot be attributed to weather alone.
+Both LLM stages produced usable answers on B; only the forecast stage did on A/C/D.
+The six-call cap can leave no quota for late fault arbitration. No formal guarantee
+of per-card two-stage success or generalization is implied.
+
+Runtime files match the evaluated archive with SHA256
+`30572035a209c48b5ed4d231d33b3432ac6cb57ca624833e136050d9fcc8fc43`.
+Documentation and configuration templates were subsequently updated for this branch.
 
 
 [中文说明见 README.zh.md](README.zh.md)

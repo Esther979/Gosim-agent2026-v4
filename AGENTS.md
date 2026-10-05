@@ -16,10 +16,18 @@ stdin/stdout loop that dispatches to everything else.
 ## Local integration branch (2026-10-05)
 
 Based on origin/LLM commit d1d51da58e82e9607a38d0b40b71fd45970dbc59.
-The default keeps the teammate strategy. The combined experimental candidate is
-selected explicitly with AGENT_CONDITIONS=quality and AGENT_SCORE_GAIN=1.
+Branch codex/llm-weather-incremental-score publishes the evaluated candidate.
+observer.project.json and .env.example select AGENT_CONDITIONS=quality and
+AGENT_SCORE_GAIN=1, with six LLM attempts, a 180-second budget and no retries.
+The Python fallback defaults still keep the teammate strategy when those variables
+are absent; direct local runs must load the supplied configuration.
 AGENT_CONDITIONS=off and AGENT_SCORE_GAIN=0 restore its numerical policy.
 The spatial-index cache is always active and preserved all four baseline scores.
+
+The runtime files match the package evaluated once as batch 7777491a on online
+cards A-D: mean 29980.755705. The prior LLM_agent_v4_Jingmeng batch averaged
+29782.55358825. LLM budgets differed, and this is not a weather-only ablation.
+See the README comparison for per-card scores, missed required targets and limits.
 
 - conditions.py/reconstruction.py contain frozen, public-input ridge inference;
   conditions_config.json contains fitted coefficients, never practice truth.
@@ -61,9 +69,9 @@ pack_agent.py              zip this folder into a project ZIP for submission
 ## Changing the strategy
 
 Target ranking, fibre filling and exposure sizing live in `agent_core/planner.py`.
-The two LLM-advised calls (forecast avoidance + bulletin check-in) are issued from
-the night-advice path in `planner.py` through `agent_core/llm_client.py`; the
-instrument-fault confirmation call is a third, rarer call from the same module. You
+The two inherited LLM uses are weekly forecast interpretation (`_on_forecast`) and
+conditional borderline instrument-fault arbitration (`_arbitrate`), both in
+`planner.py` through `agent_core/llm_client.py`. You
 can change the ranking heuristic, add new signals to `SurveyState`, change what (if
 anything) the LLM is asked, or replace the LLM calls entirely with a different
 approach -- the only hard requirement enforced by `validation.py` is that whatever
