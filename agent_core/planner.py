@@ -63,7 +63,7 @@ ANCHORS = 6
 # the faint ones are still short.
 JOINT_DURATIONS = (180, 240, 300, 450, 600, 750, 900, 1200, 1500, 1800, 2400, 3000, 3600)
 JOINT_OVERHEAD_SECONDS = 20.0     # charged to every exposure so that very short ones are not favoured
-JOINT_ANCHORS = 10
+JOINT_ANCHORS = 24
 POOL_REFRESH_HOURS = 0.4          # how often the whole catalogue is rescanned for candidates
 # A target that will still be observable on later nights is worth less right now the further
 # it is below the altitude it reaches at transit: the same exposure will buy more of it then.
@@ -72,6 +72,8 @@ POOL_REFRESH_HOURS = 0.4          # how often the whole catalogue is rescanned f
 # near the zenith a few hours or weeks later.
 DEFER_POWER = 5.0
 DEFER_MIN_NIGHTS = 2
+BAND_CHECKS = 80                  # most recent band checks used to read the sky level for the program declaration
+BAND_MIN_CHECKS = 12
 ANCHOR_POOL = 300
 CLOSED_KINDS = {"rain", "storm"}
 BLOCKING_KINDS = {"terrain_obstruction", "rocket_launch"}
@@ -131,8 +133,12 @@ def _median(values: list) -> float:
 def _censored_median(samples: list) -> float:
     """Median of (value, is_lower_bound) samples by the Kaplan-Meier product-limit
     estimate: a lower bound stays "at risk" up to its value and is then withdrawn without
-    counting as an observation. If the estimate never falls to one half (too many lower
-    bounds at the top), the largest value is returned -- the median is at least that."""
+    counting as an observation. If the estimate never falls to one half, more than half of
+    the night consists of lower bounds -- exposures sized so that the target just finished.
+    Their bounds then sit a fixed margin under the true level, so the median of all values
+    is returned: it is comparable from night to night, which is what the detector needs
+    (the largest bound, the formally correct "at least", jumps around with a single
+    sample)."""
     ordered = sorted(samples, key=lambda s: (s[0], s[1]))
     surviving, at_risk = 1.0, len(ordered)
     for value, bound in ordered:
@@ -141,7 +147,7 @@ def _censored_median(samples: list) -> float:
             if surviving <= 0.5:
                 return value
         at_risk -= 1
-    return ordered[-1][0]
+    return ordered[len(ordered) // 2][0]
 
 # Time-limited observation requests (participant guide section 8 / appendix B). There is
 # no penalty for letting one expire -- `observation_requests.miss_penalty` is fixed at 0 --
@@ -287,6 +293,8 @@ class Planner:
         self._pace_cost: dict = {0: None, 1: None, 2: None}   # measured seconds per planned decision, per level
         self._pace_samples: dict = {0: [], 1: [], 2: []}
         self._pool: list | None = None                # candidate pool, see plan()
+        self._band_scale_last = 1.0
+        self._band_scale_night = -1
         self._pool_night = -1
         self._pool_hours = 0.0
         self._pace_prev: tuple | None = None
@@ -1199,7 +1207,7 @@ class Planner:
             ha = wrap180(lst - state.ra[j])
             up = (state.hmax[j] - ha) / SIDEREAL_DEG_PER_SECOND if state.hmax[j] < 180 else 1e9
             f = state.factor[j]
-            done, weight = f * f, state.weight[j]
+            weight = state.weight[j]
             needs = state.required[j] and f < 0.5
             if state.last_night[j] - night_index + 1 >= DEFER_MIN_NIGHTS:
                 best_alt = min(89.0, 90.0 - abs(state.dec[j] - state.lat))
@@ -1207,13 +1215,18 @@ class Planner:
                 here = scoring.quality_model(alt, 1.0) or 0.0
                 if best_model > 0.0:
                     damp *= min(1.0, here / best_model) ** DEFER_POWER
+            ceiling = max(1e-6, min(1.0, k * min(state.max_exposure, up)))
             row = []
             for d in durations:
                 if d > up or damp <= 0.0 or k <= 0.0:
                     row.append(0.0)
                     continue
                 reach = min(1.0, k * d)
-                value = weight * max(0.0, reach * reach - done)
+                # (reach - done) x (reach / ceiling): for a target that can be finished this is
+                # the usual discount on half-done work; a target too faint to ever finish in
+                # one exposure is judged against its own ceiling instead of being written
+                # down as permanently half done
+                value = weight * max(0.0, reach - f) * (reach / ceiling)
                 if needs and reach >= 0.5:
                     value += REQUIRED_BONUS
                 row.append(value * damp)
@@ -1314,6 +1327,33 @@ class Planner:
                   for fib, (values, owners) in cells.items() if owners[ti] >= 0}
         return (c_alt, c_az, chosen, durations[ti]) if chosen else None
 
+    def _band_scale(self, night_index: int) -> float:
+        """The factor that turns a target's quality model into the sky quality its program
+        band is decided on. The learned exposure scale is the wrong thing to use: it
+        contains instrument efficiency (an earthquake or a fault lowers it for weeks), and
+        the band does not. So the factor is read directly off tonight's recent band checks
+        -- saturated hits whose score shows which band they really fell in: the value that
+        explains most of them, nearest to the previous answer. With too few checks the
+        learned scale is used, as before."""
+        state = self.state
+        fallback = state.scale / 0.95
+        checks = [c for c in list(state._band_checks)[-BAND_CHECKS:] if c[3] == night_index]
+        if len(checks) < BAND_MIN_CHECKS:
+            return fallback if self._band_scale_night != night_index else self._band_scale_last
+        band = state.scoring.program_band
+        best, best_values = -1, []
+        for step in range(66):
+            value = 0.30 + 0.02 * step
+            agree = sum(1 for program, matched, model, _n in checks if (band(value * model) == program) == matched)
+            if agree > best:
+                best, best_values = agree, [value]
+            elif agree == best:
+                best_values.append(value)
+        anchor = self._band_scale_last if self._band_scale_night == night_index else fallback
+        chosen = min(best_values, key=lambda v: abs(v - anchor))
+        self._band_scale_last, self._band_scale_night = chosen, night_index
+        return chosen
+
     def _finish_plan(self, now, lst, c_alt, c_az, chosen, seconds_left, moon, altaz, hours, night_index,
                      fixed_duration=None):
         state = self.state
@@ -1397,7 +1437,7 @@ class Planner:
         if not assignments:
             return None
 
-        band_scale = state.scale / 0.95
+        band_scale = self._band_scale(night_index)
         votes = {"DARK": 0.0, "BRIGHT": 0.0, "BACKUP": 0.0}
         for fiber, item in info.items():
             if str(fiber) not in assignments:
@@ -1489,6 +1529,6 @@ if __name__ == "__main__":
     assert _censored_median(exact) == 0.6
     # lower bounds above the dips pull the median up to where the real observations are
     assert _censored_median([(0.1, False), (0.15, False)] + [(0.5, True)] * 6 + [(0.6, False)]) == 0.6
-    # nothing but lower bounds above: the median is at least the largest of them
-    assert _censored_median([(0.1, False)] + [(0.5, True)] * 5) == 0.5
+    # mostly lower bounds: the median of all values, which is comparable night to night
+    assert _censored_median([(0.1, False)] + [(0.5, True)] * 4 + [(0.9, True)]) == 0.5
     print("planner self-test: censored median OK (3 cases)")
