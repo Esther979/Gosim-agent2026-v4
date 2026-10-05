@@ -92,6 +92,7 @@ class SurveyState:
         n = len(self.ids)
         self.hmax = [max_hour_angle_deg(self.dec[i], self.lat, self.min_alt + ALT_MARGIN_DEG) for i in range(n)]
         self.factor = [0.0] * n
+        self.best_score = [0.0] * n
         self.misses = [0] * n
         self.attempts = [0] * n
         self.active = [i for i in range(n) if self.hmax[i] > 0.0]
@@ -132,6 +133,7 @@ class SurveyState:
             self._cells.setdefault(key, []).append((self.ra[i], i))
         for band in self._cells.values():
             band.sort(key=lambda pair: pair[0])
+        self._cell_ra = {key: [ra for ra, _ in band] for key, band in self._cells.items()}
 
     def neighbours(self, ra: float, dec: float, radius: float):
         """Indices within `radius` degrees of (ra, dec), using the 1-degree declination-band index."""
@@ -151,7 +153,7 @@ class SurveyState:
                 spans = [(lo, 360.0), (0.0, hi - 360.0)]
             else:
                 spans = [(lo, hi)]
-            keys = [r for r, _ in band]
+            keys = self._cell_ra[key]
             for low, high in spans:
                 start = bisect.bisect_left(keys, low)
                 end = bisect.bisect_right(keys, high)
@@ -242,6 +244,7 @@ class SurveyState:
 
         for i in range(len(self.ids)):
             target_id = self.ids[i]
+            self.best_score[i] = best.get(target_id, 0.0)
             if target_id in exact:
                 self.factor[i] = exact[target_id]
                 continue
@@ -287,6 +290,7 @@ class SurveyState:
                 self.misses[i] += 1
                 continue
             score = hits[target_id]
+            self.best_score[i] = max(self.best_score[i], score)
             if score <= 0.0:
                 if any_positive:
                     self.blocked.append((prediction.az, prediction.alt))

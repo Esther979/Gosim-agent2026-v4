@@ -1,5 +1,35 @@
 # python-agent -- an example agent for participant-agent-protocol-v4
 
+> Integration branch, 2026-10-05: based on `origin/LLM` at `d1d51da`, not `main`.
+> The actual inherited LLM stages are weekly forecast interpretation and borderline
+> fault arbitration; the historical nightly-call description below is superseded.
+
+The default preserves the teammate strategy with a cached spatial index. Enable
+both `AGENT_CONDITIONS=quality` and `AGENT_SCORE_GAIN=1` to try the transferred
+candidate: frozen public-input ridge quality estimates and actual best-score
+increments. It preserves the joint scheduler, sky-band estimator and fault detector.
+The quality proxy uses a representative 900-second duration, not a future rollout.
+Use `LLM_DISABLED=1` for API-free numerical comparisons. Set conditions to `off` and
+score gain to `0` for the original numerical policy. Credentials and training labels
+are not included. Full experiments are stored outside this deployment directory at
+`../gosim-observer-examples/experiments/teammate_merge/`.
+
+Initial four-card numerical means: baseline 6148.92; candidate 6179.60 (+0.50%).
+L3 regressed by about 152 points. These reused practice cards are not blind validation
+or platform scores; consult the complete comparison before changing deployment.
+
+
+Completed paired means: numerical all-card fit 6148.92 -> 6179.60 (+0.50%);
+leave-one-card-out weather 6148.92 -> 6126.80 (-0.36%); live Kimi with at most six
+attempts per card 6086.10 -> 6166.91 (+1.33%). The numerical candidate reproduced
+all four scores on rerun. Each live policy/card was run once with independent model
+responses. OOF excludes weather training data, not scheduler development decisions.
+28 automated tests and 16 inherited planner self-checks pass. Fault arbitration is
+conditional; successful execution of both LLM stages on every card is not established.
+The separately packaged candidate enables both flags in its project manifest; this
+repository keeps the original policy as the default. No remote push or submission.
+
+
 [中文说明见 README.zh.md](README.zh.md)
 
 A small, Codex-style reference implementation for the GOSIM survey26 hackathon's

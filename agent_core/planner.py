@@ -24,6 +24,7 @@ example target-for-target, so both examples solve the problem the same way.
 from __future__ import annotations
 
 import math
+import os
 from datetime import timedelta
 
 from .geometry import (
@@ -221,6 +222,9 @@ OUTLOOK_SYSTEM_PROMPT = (
 
 class Planner:
     def __init__(self, state, log=lambda text: None):
+        from .weather_adapter import build_conditions
+        self.conditions_mode, self.conditions = build_conditions(state)
+        self.incremental_scores = os.environ.get('AGENT_SCORE_GAIN', '0') == '1'
         self.state = state
         self.log = log
         self.grid = state.fiber_grid
@@ -331,6 +335,8 @@ class Planner:
                          f"{message.get('status')} (reward {message.get('score_delta', 0.0)})")
         state.on_messages(payload.get("new_messages", []), payload.get("latest_bulletin"))
         state.on_result(payload.get("last_result"), hours)
+        if self.conditions is not None:
+            self.conditions.update(payload)
         last_result = payload.get("last_result")
         if last_result and last_result.get("action") == "observe":
             self.total_assigned += int(last_result.get("assigned_count", 0))
@@ -400,6 +406,8 @@ class Planner:
         return action
 
     def on_finish(self, payload: dict) -> None:
+        if self.conditions is not None:
+            self.log(f"conditions: {self.conditions.summary()}")
         self.trace.write({"event": "finish", **payload})
         self.trace.close()
         self.log(f"planner: finished termination_reason={payload.get('termination_reason')} "
@@ -968,7 +976,7 @@ class Planner:
         if self._direction_factor(alt, az) < 1.0:
             return None
         model = scoring.quality_model(alt, lunar_factor(moon, state.ra[i], state.dec[i], scoring.lunar_model)) or 0.0
-        k = (state.flux[i] * model * state.scale * PLAN_FACTOR_SAFETY) / scoring.f0t0
+        k = (state.flux[i] * model * self._quality_scale(alt, az) * PLAN_FACTOR_SAFETY) / scoring.f0t0
         if k <= 0.0:
             return None
         needed = threshold * REQUEST_MARGIN / k
@@ -1042,6 +1050,12 @@ class Planner:
         f = state.factor[i]
         damp = 0.6 ** state.misses[i]
         threshold = state.scoring.required_threshold
+        if self.incremental_scores:
+            top = max(state.scoring.program_multipliers.values())
+            gain = max(0., state.weight[i]*top - state.best_score[i])
+            if state.required[i] and f < threshold:
+                gain += REQUIRED_BONUS
+            return gain*damp if gain > .02*state.weight[i] else 0.
         if state.required[i]:
             if f >= threshold:
                 return state.weight[i] * max(0.0, 1.0 - f * f) * damp
@@ -1049,6 +1063,13 @@ class Planner:
         return 0.0 if f >= DONE_FACTOR else state.weight[i] * (1.0 - f * f) * damp
 
     # -- main planning pass -------------------------------------------------------
+
+    def _quality_scale(self, alt, az):
+        # Use a representative 900s weather factor for the joint duration scan;
+        # exact per-duration inference was slower and did not improve four-card score.
+        if self.conditions is None:
+            return self.state.scale
+        return self.conditions.predict(alt, az, 900).effective_scale
 
     def plan(self, now, night_end, night_index: int, hours: float, allow_request: bool = True):
         state = self.state
@@ -1099,10 +1120,13 @@ class Planner:
                 cap = min(1.0, k_best * longest)
                 if state.required[i] and f < 0.5:
                     worth = v
-                elif cap - f <= 0.02:
+                elif (cap - f <= 0.02 if not self.incremental_scores else
+                      state.weight[i]*max(state.scoring.program_multipliers.values())*cap
+                      - state.best_score[i] <= .02*state.weight[i]):
                     continue
                 else:
-                    worth = state.weight[i] * (cap - f)
+                    worth = (state.weight[i]*max(state.scoring.program_multipliers.values())*cap
+                             - state.best_score[i] if self.incremental_scores else state.weight[i]*(cap-f))
                 seconds = max(180.0, min(longest, cap / k_best))
                 candidates.append((worth / seconds * (1.0 + 2.0 / nights_left), i))
         if not candidates:
@@ -1130,7 +1154,7 @@ class Planner:
             alt, az = altaz(i)
             lunar = lunar_factor(moon, state.ra[i], state.dec[i], scoring.lunar_model)
             model = scoring.quality_model(alt, lunar) or 0.0
-            k = (state.flux[i] * model * state.scale * PLAN_FACTOR_SAFETY) / scoring.f0t0
+            k = (state.flux[i] * model * self._quality_scale(alt, az) * PLAN_FACTOR_SAFETY) / scoring.f0t0
             ha = wrap180(lst - state.ra[i])
             up = (state.hmax[i] - ha) / SIDEREAL_DEG_PER_SECOND if state.hmax[i] < 180 else 1e9
             reach = min(1.0, k * min(state.max_exposure, up, seconds_left))
@@ -1249,11 +1273,13 @@ class Planner:
         if not durations:
             return None
         count = len(durations)
+        # A scheduling preference, never added to physical observation duration.
         per_second = [1.0 / (d + JOINT_OVERHEAD_SECONDS) for d in durations]
         gains_cache: dict[int, list] = {}
         prefix, defer_power = self._usable_prefix, self._defer_power
         usable_before = prefix[night_index]          # tonight counts in full: it is being used right now
         usable_before -= 1.0 - self._usable[night_index]
+        sky_band_scale = self._band_scale(night_index) if self.incremental_scores else None
 
         def gains(j: int) -> list:
             cached = gains_cache.get(j)
@@ -1262,7 +1288,7 @@ class Planner:
             alt, az = altaz(j)
             damp = (0.6 ** state.misses[j]) * (0.7 ** state.attempts[j]) * self._direction_factor(alt, az)
             model = scoring.quality_model(alt, lunar_factor(moon, state.ra[j], state.dec[j], scoring.lunar_model)) or 0.0
-            k = (state.flux[j] * model * state.scale * PLAN_FACTOR_SAFETY) / scoring.f0t0
+            k = (state.flux[j] * model * self._quality_scale(alt, az) * PLAN_FACTOR_SAFETY) / scoring.f0t0
             ha = wrap180(lst - state.ra[j])
             up = (state.hmax[j] - ha) / SIDEREAL_DEG_PER_SECOND if state.hmax[j] < 180 else 1e9
             f = state.factor[j]
@@ -1274,7 +1300,10 @@ class Planner:
                 here = scoring.quality_model(alt, 1.0) or 0.0
                 if best_model > 0.0:
                     damp *= min(1.0, here / best_model) ** defer_power
-            ceiling = max(1e-6, min(1.0, k * min(state.max_exposure, up)))
+            longest = min(state.max_exposure, up)
+            unit_rate = state.flux[j] * model * PLAN_FACTOR_SAFETY / scoring.f0t0
+            ceiling_k = unit_rate * self._quality_scale(alt, az)
+            ceiling = max(1e-6, min(1.0, ceiling_k * longest))
             row = []
             for d in durations:
                 if d > up or damp <= 0.0 or k <= 0.0:
@@ -1286,6 +1315,10 @@ class Planner:
                 # one exposure is judged against its own ceiling instead of being written
                 # down as permanently half done
                 value = weight * max(0.0, reach - f) * (reach / ceiling)
+                if self.incremental_scores:
+                    band = scoring.program_band(model*sky_band_scale)
+                    multiplier = scoring.program_multipliers.get(band, 1.)
+                    value = max(0., weight*reach*multiplier-state.best_score[j]) * (reach/ceiling)
                 if needs and reach >= 0.5:
                     value += REQUIRED_BONUS
                 row.append(value * damp)
@@ -1428,7 +1461,7 @@ class Planner:
             model = scoring.quality_model(alt, lunar) or 0.0
             ha = wrap180(lst - state.ra[j])
             up = (state.hmax[j] - ha) / SIDEREAL_DEG_PER_SECOND if state.hmax[j] < 180 else 1e9
-            k = (state.flux[j] * model * state.scale * PLAN_FACTOR_SAFETY) / scoring.f0t0
+            k = (state.flux[j] * model * self._quality_scale(alt, az) * PLAN_FACTOR_SAFETY) / scoring.f0t0
             info[fiber] = {"i": j, "alt": alt, "az": az, "model": model, "up": up, "k": k}
         center_up = (c_hmax - c_ha) / SIDEREAL_DEG_PER_SECOND if c_hmax < 180 else 1e9
 
@@ -1509,6 +1542,15 @@ class Planner:
             matched = votes[name] * scoring.program_multipliers.get(name, 1.0)
             mismatched = (votes["DARK"] + votes["BRIGHT"] + votes["BACKUP"] - votes[name]) * scoring.mismatch_multiplier
             score = matched + mismatched
+            if self.incremental_scores:
+                score = 0.
+                for fiber, item in info.items():
+                    if str(fiber) not in assignments:
+                        continue
+                    i = item['i']
+                    band = scoring.program_band(item['model'] * band_scale)
+                    predicted = state.weight[i] * min(1., item['k'] * duration) * scoring.program_multiplier(name, band)
+                    score += max(0., predicted-state.best_score[i])
             if score > best_score:
                 best_score, program = score, name
         if state.force_program:
@@ -1527,6 +1569,9 @@ class Planner:
         state.pending_band_scale = band_scale
         state.pending_duration = duration
         state.pending_night = night_index
+        if self.conditions is not None:
+            self.conditions.remember(now, self._current_action_index, state.pending,
+                                     program, duration)
 
         return {
             "action": "observe",
