@@ -96,7 +96,11 @@ FAULT_SKY_OK = 0.9                 # logged as sky_ok when the night's sky estim
 # slowly than that is not recovering, it has a fault sitting on top of the earthquake.
 FAULT_RECOVERY_RANGE = (0.6, 0.90)
 FAULT_MAX_FORCED_PER_NIGHT = 4
-FAULT_MAX_LLM_WAITS = 2
+# How many nights in a row the model may hold back a borderline alarm. It is asked again
+# every night with the new night's data. Its "wait" verdicts have been right every time
+# so far (weather spells of 3-4 nights at 70-80%), while the rule taking over after two
+# of them produced false reports; a clear-cut drop never reaches the model at all.
+FAULT_MAX_LLM_WAITS = 5
 
 FAULT_SYSTEM_PROMPT = (
     "You arbitrate a borderline instrument-fault alarm for a robotic telescope survey. "
@@ -824,10 +828,10 @@ class Planner:
         if tier == "strong":
             self._report_due = f"rule: {summary}"
             return
-        # Borderline. Every false alarm seen so far was of this kind and was gone by the
-        # third night, so the rule alone waits for one more low night; the model may report
-        # sooner when the picture is clearly a fault, or hold back at most
-        # FAULT_MAX_LLM_WAITS times.
+        # Borderline. Without a model the rule waits for one more low night and then reports.
+        # With one, the model is asked every night: it may report at once when the picture
+        # is clearly a fault, or hold the alarm back, at most FAULT_MAX_LLM_WAITS nights
+        # running, after which the rule reports whatever the model says.
         needed = mode[1]
         if len(run) >= needed + FAULT_MAX_LLM_WAITS:
             self._report_due = f"rule (borderline, {len(run)} nights): {summary}"
@@ -839,6 +843,12 @@ class Planner:
             self._report_due = f"model: borderline, {summary}"
         elif verdict == "wait_one_night":
             self._llm_waits += 1
+        elif self._llm_waits > 0 and not self.llm.disabled:
+            # the model has been holding this alarm back and could not be reached tonight:
+            # one failed call is no reason to overrule it, but it does use up one of its waits
+            self._llm_waits += 1
+            self.log(f"planner: night {date} borderline alarm kept on hold (model unreachable, "
+                     f"{self._llm_waits} of {FAULT_MAX_LLM_WAITS} waits used)")
         elif len(run) > needed:
             self._report_due = f"rule (borderline, no model verdict, {len(run)} nights): {summary}"
 
