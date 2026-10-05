@@ -1501,6 +1501,7 @@ class Planner:
                     clean=clean and self._direction_factor(item["alt"], item["az"]) >= 1.0,
                 )
         state.pending_program = program
+        state.pending_band_scale = band_scale
         state.pending_duration = duration
         state.pending_night = night_index
 

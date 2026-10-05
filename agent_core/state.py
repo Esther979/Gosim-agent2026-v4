@@ -110,6 +110,7 @@ class SurveyState:
         self.force_program: Optional[str] = None
         self.pending: dict[str, PendingPrediction] = {}
         self.pending_program = "BACKUP"
+        self.pending_band_scale: Optional[float] = None   # sky-only band factor the program was declared with
         self.pending_duration = 0
         self.blocked: list[tuple[float, float]] = []       # (az, alt) where a hit scored zero
         self.notices: set[str] = set()                      # "kind|direction"
@@ -301,8 +302,21 @@ class SurveyState:
             factor_if_miss = score / (weight * mismatch) if mismatch > 0 else 0.0
             ratio_match = (factor_if_match * f0t0) / (self.flux[i] * self.pending_duration * prediction.model) \
                 if self.flux[i] > 0 and self.pending_duration > 0 and prediction.model > 0 else 0.0
-            band = scoring.program_band(ratio_match * prediction.band_model)
+            # Did this hit earn the declared program's multiplier? The score alone cannot say
+            # (score = weight x factor x multiplier). The band is a pure sky quantity, so it
+            # is predicted from the sky-only level the planner declared the program with.
+            # Predicting it from ratio_match instead (the fallback, used until that level
+            # exists) is wrong whenever instrument efficiency is down: the ratio contains
+            # the efficiency, the band comes out too low, a matched hit is read as a mismatch
+            # and its factor is overstated by the full multiplier -- during a fault or after
+            # an earthquake that marked required targets at 0.46 as done at 0.56.
+            if self.pending_band_scale is not None:
+                band = scoring.program_band(self.pending_band_scale * prediction.model)
+            else:
+                band = scoring.program_band(ratio_match * prediction.band_model)
             matched = band == self.pending_program
+            if abs(multiplier_seen - declared_multiplier) < 2e-4:
+                matched = True                      # saturated in the declared band, no doubt
             if abs(multiplier_seen - mismatch) < 2e-4:
                 # score == weight x mismatch multiplier exactly: a saturated hit in another
                 # band. Without this, a BACKUP/BRIGHT declaration reads it as an unsaturated
