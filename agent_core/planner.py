@@ -284,6 +284,10 @@ class Planner:
         self._pace_cost: dict = {0: None, 1: None, 2: None}   # measured seconds per planned decision, per level
         self._pace_samples: dict = {0: [], 1: [], 2: []}
         self._pool: list | None = None                # candidate pool, see plan()
+        # quality model of every target at its own transit altitude with no moon: the best
+        # its geometry ever allows, used to judge what a target could reach at its best
+        self._model_best = [state.scoring.quality_model(min(89.0, 90.0 - abs(dec - state.lat)), 1.0) or 0.0
+                            for dec in state.dec]
         self._band_scale_last = 1.0
         self._band_scale_night = -1
         self._pool_night = -1
@@ -1072,6 +1076,8 @@ class Planner:
             state.active = still_active
             self._pool, self._pool_night, self._pool_hours = pool, night_index, hours
         candidates: list[tuple[float, int]] = []
+        best_scale = max(state.scale, state.prior_scale) * PLAN_FACTOR_SAFETY / state.scoring.f0t0
+        longest = float(state.max_exposure)
         for i in self._pool:
             v = self._value(i)
             if v <= 0.0:
@@ -1080,8 +1086,25 @@ class Planner:
             h = state.hmax[i]
             if -h <= ha <= h - min_visible:
                 nights_left = max(1, state.last_night[i] - night_index + 1)
-                setting = (1.0 + 0.5 * max(0.0, ha / h)) if h < 180 else 1.0
-                candidates.append((v * (1.0 + 2.0 / nights_left) * setting, i))
+                # Rank by what the target can pay per second at its best, not by how much of
+                # it is left: the seeds of the joint search are taken from the head of this
+                # list, and a list headed by untouched faint targets -- many of which cannot
+                # be improved at all -- keeps the cheap, finishable ones from ever seeding a
+                # pointing. A target that even at its best cannot beat what it already has
+                # is dropped.
+                k_best = state.flux[i] * self._model_best[i] * best_scale
+                if k_best <= 0.0:
+                    continue
+                f = state.factor[i]
+                cap = min(1.0, k_best * longest)
+                if state.required[i] and f < 0.5:
+                    worth = v
+                elif cap - f <= 0.02:
+                    continue
+                else:
+                    worth = state.weight[i] * (cap - f)
+                seconds = max(180.0, min(longest, cap / k_best))
+                candidates.append((worth / seconds * (1.0 + 2.0 / nights_left), i))
         if not candidates:
             return None
         candidates.sort(key=lambda t: -t[0])
