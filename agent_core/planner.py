@@ -186,6 +186,7 @@ LLM_BUDGET_FRACTION = 500.0 / 900.0   # of the card's wall-clock limit; the dete
 # expected usable fraction for each night it covers. A share of the budget is kept back for
 # fault arbitration; a forecast that arrives when less than that is left is read by rule.
 OUTLOOK_RESERVE_SECONDS = 60.0
+OUTLOOK_PACING_SLACK_SECONDS = 45.0  # how far ahead of an even spend over the survey a forecast call may be
 OUTLOOK_MIN_WALLCLOCK_FRACTION = 150.0 / 900.0
 OUTLOOK_LOST_NIGHT = 0.3            # a night expected to be less usable than this is not counted on
 CLOSING_KINDS = ("rain|ALL", "storm|ALL")   # the only prior the rule has; everything else is learned
@@ -536,6 +537,9 @@ class Planner:
         elif self.llm.budget_left_seconds() < OUTLOOK_RESERVE_SECONDS + self.llm.call_timeout_seconds \
                 or left < OUTLOOK_MIN_WALLCLOCK_FRACTION * state.wallclock_limit:
             status = "skipped"
+        elif self.llm.spent_seconds > OUTLOOK_PACING_SLACK_SECONDS + \
+                (self.llm.total_budget_seconds - OUTLOOK_RESERVE_SECONDS) * (covered[0] + 7) / max(7, len(state.nights)):
+            status = "paced"                           # ahead of the budget's pace: keep some for later forecasts
         else:
             experience = {key: {"nights": count, "usable_fraction": round(total / count, 2)}
                           for key, (total, count) in sorted(self._kind_stats.items()) if count}

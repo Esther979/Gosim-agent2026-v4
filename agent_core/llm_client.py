@@ -15,12 +15,13 @@ local run can differ without code changes):
 
     LLM_TEMPERATURE          omitted from the request when unset (provider default); the
                              Kimi k3 reasoning model rejects any value other than 1
-    LLM_MAX_TOKENS           default 1200 -- reasoning models spend "thinking" tokens inside
-                             max_tokens, so the official 250 truncates k3 before its JSON
+    LLM_MAX_TOKENS           default 3000 -- reasoning models spend "thinking" tokens inside
+                             max_tokens; 250 (official) always and 1200 sometimes ran out
+                             before k3 had written its JSON
     LLM_USER_AGENT           when set, sent as the HTTP User-Agent (identifying this agent
                              truthfully); when unset the header is left to the standard
                              library, exactly like the official example
-    LLM_CALL_TIMEOUT_SECONDS default 25; LLM_TOTAL_BUDGET_SECONDS default 500;
+    LLM_CALL_TIMEOUT_SECONDS default 30; LLM_TOTAL_BUDGET_SECONDS default 500;
     LLM_MAX_CALLS default 100; LLM_MAX_RETRIES default 0 (retries AFTER the first
                              attempt; 0 = a timed-out call is not repeated)
     LLM_DISABLED             "1" switches the model off entirely: no API key is needed,
@@ -77,7 +78,7 @@ def require_api_key() -> None:
 
 
 class LLMClient:
-    def __init__(self, log=lambda text: None, call_timeout_seconds: float = 25.0,
+    def __init__(self, log=lambda text: None, call_timeout_seconds: float = 30.0,
                  total_budget_seconds: float = 500.0, max_calls: int = 100, max_retries: int = 0):
         self.log = log
         self.disabled = llm_disabled()
@@ -89,7 +90,7 @@ class LLMClient:
         self.total_budget_seconds = _env_float("LLM_TOTAL_BUDGET_SECONDS", total_budget_seconds)
         self.max_calls = int(_env_float("LLM_MAX_CALLS", max_calls))
         self.max_retries = max(0, int(_env_float("LLM_MAX_RETRIES", max_retries)))
-        self.max_tokens = int(_env_float("LLM_MAX_TOKENS", 1200))
+        self.max_tokens = int(_env_float("LLM_MAX_TOKENS", 3000))
         temp = os.environ.get("LLM_TEMPERATURE", "").strip()
         self.temperature = float(temp) if temp else None
         self.user_agent = os.environ.get("LLM_USER_AGENT", "").strip()
@@ -180,6 +181,8 @@ class LLMClient:
                 last_error = exc
             finally:
                 self.spent_seconds += time.monotonic() - started
-        self.log(f"llm: call failed after {1 + self.max_retries} attempt(s) ({type(last_error).__name__}); "
+        # a ValueError is ours (reply had no JSON object / was cut off) and its text says which
+        detail = f": {str(last_error)[:120]}" if isinstance(last_error, ValueError) else ""
+        self.log(f"llm: call failed after {1 + self.max_retries} attempt(s) ({type(last_error).__name__}{detail}); "
                  "this step falls back to its rule-based answer")
         return None
