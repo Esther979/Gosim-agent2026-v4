@@ -111,7 +111,8 @@ FAULT_SYSTEM_PROMPT = (
     "notice was active; notice_kinds = public weather/event notices that night; "
     "profile = the night in two-hour blocks as [hours after night start, ratio, samples]. "
     "The last nights have ratio between 0.70 and 0.80: too low to ignore, too high to be "
-    "sure. Decide between reporting a fault now and waiting one more night.\n"
+    "sure. Say whether this should be reported as a fault or held back one more night; "
+    "you will be asked again tomorrow with the new night.\n"
     "How the candidates look: an INSTRUMENT FAULT is one abrupt step at a single moment "
     "(inside a night's profile: normal blocks, then low blocks) and afterwards the ratio "
     "stays flat at the same reduced level, block after block and night after night, with "
@@ -731,7 +732,7 @@ class Planner:
         self._awaiting_report_result = True
         self.log(f"planner: reporting instrument fault at {payload.get('now_utc')} ({reason})")
         return {"action": "report", "reason": reason,
-                "decision_source": "llm" if reason.startswith("model") else "rule"}
+                "decision_source": "rule+llm" if "model agrees" in reason else "rule"}
 
     def _settle_report(self, correct: bool, payload: dict) -> None:
         self.log(f"planner: report at {payload.get('now_utc')} was {'correct' if correct else 'FALSE'}")
@@ -828,10 +829,11 @@ class Planner:
         if tier == "strong":
             self._report_due = f"rule: {summary}"
             return
-        # Borderline. Without a model the rule waits for one more low night and then reports.
-        # With one, the model is asked every night: it may report at once when the picture
-        # is clearly a fault, or hold the alarm back, at most FAULT_MAX_LLM_WAITS nights
-        # running, after which the rule reports whatever the model says.
+        # Borderline. The rule waits for one more low night than a clear-cut drop needs and
+        # then reports. The model is asked every night and has a veto, not a trigger: it
+        # can hold the alarm back, at most FAULT_MAX_LLM_WAITS nights running, after which
+        # the rule reports whatever the model says; its "report" does not bring the report
+        # forward.
         needed = mode[1]
         if len(run) >= needed + FAULT_MAX_LLM_WAITS:
             self._report_due = f"rule (borderline, {len(run)} nights): {summary}"
@@ -839,18 +841,24 @@ class Planner:
         verdict = None
         if not self.llm.disabled and self._llm_waits < FAULT_MAX_LLM_WAITS:
             verdict = self._arbitrate(payload)
-        if verdict == "report":
-            self._report_due = f"model: borderline, {summary}"
-        elif verdict == "wait_one_night":
+        if verdict == "wait_one_night":
             self._llm_waits += 1
-        elif self._llm_waits > 0 and not self.llm.disabled:
+        elif verdict is None and self._llm_waits > 0 and not self.llm.disabled:
             # the model has been holding this alarm back and could not be reached tonight:
             # one failed call is no reason to overrule it, but it does use up one of its waits
             self._llm_waits += 1
             self.log(f"planner: night {date} borderline alarm kept on hold (model unreachable, "
                      f"{self._llm_waits} of {FAULT_MAX_LLM_WAITS} waits used)")
         elif len(run) > needed:
-            self._report_due = f"rule (borderline, no model verdict, {len(run)} nights): {summary}"
+            # the rule's own condition (one low night more than a clear-cut drop needs) is
+            # met and the model does not object
+            agreed = "model agrees" if verdict == "report" else "no model verdict"
+            self._report_due = f"rule (borderline, {agreed}, {len(run)} nights): {summary}"
+        elif verdict == "report":
+            # The model can hold an alarm back but not bring one forward: of its five
+            # "report" verdicts on a two-night borderline drop four were weather. The rule
+            # still wants its extra low night, and the model is asked again then.
+            self.log(f"planner: night {date} model would report; the rule waits for one more low night")
 
     def _arbitrate(self, payload: dict):
         """Borderline alarm: one model call decides between reporting now and waiting one
