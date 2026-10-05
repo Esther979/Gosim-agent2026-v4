@@ -74,6 +74,18 @@ DEFER_MIN_NIGHTS = 2
 BAND_CHECKS = 80                  # most recent band checks used to read the sky level for the program declaration
 BAND_MIN_CHECKS = 12
 ANCHOR_POOL = 300
+# Region pressure (see _update_pressure). The sky is cut into RA strips; a strip whose
+# remaining work exceeds its share of the remaining observing time has pressure > 1, and a
+# target's worth is multiplied by pressure ** PRESSURE_GAMMA. Without it the search only
+# asks "what pays best right now" and leaves a strip that is setting for the season half
+# done (official card A: a third of the catalogue was visible for 323 hours and got 167),
+# while spending those hours on strips that stay up for months. The exponent is kept low:
+# measured on the synthetic official cards 0.5 gains about as much on the cards that have
+# such a strip as 1.0 does and loses less on those that do not; 1.5 and 2.0 lose overall.
+RA_BIN_DEG = 15.0
+PRESSURE_ALT_DEG = 40.0            # a strip counts as available while it stands above this
+PRESSURE_GAMMA = 0.5
+PRESSURE_RANGE = (0.5, 2.5)
 CLOSED_KINDS = {"rain", "storm"}
 BLOCKING_KINDS = {"terrain_obstruction", "rocket_launch"}
 DIRECTION_AZ = {"N": 0.0, "NE": 45.0, "E": 90.0, "SE": 135.0, "S": 180.0,
@@ -292,6 +304,24 @@ class Planner:
         # its geometry ever allows, used to judge what a target could reach at its best
         self._model_best = [state.scoring.quality_model(min(89.0, 90.0 - abs(dec - state.lat)), 1.0) or 0.0
                             for dec in state.dec]
+        # altitude from hour angle: sin(alt) = sin(lat) sin(dec) + cos(lat) cos(dec) cos(HA)
+        lat = math.radians(state.lat)
+        self._sin_sin = [math.sin(lat) * math.sin(math.radians(dec)) for dec in state.dec]
+        self._cos_cos = [math.cos(lat) * math.cos(math.radians(dec)) for dec in state.dec]
+        # sidereal time at the start of every night and how far it turns during the night
+        self._night_lst0 = [local_sidereal_deg(start, state.lon) for start, _end in state.nights]
+        self._night_turn = [(end - start).total_seconds() * SIDEREAL_DEG_PER_SECOND for start, end in state.nights]
+        bins = int(round(360.0 / RA_BIN_DEG))
+        self._bin_of = [int(ra // RA_BIN_DEG) % bins for ra in state.ra]
+        reach: dict = {}
+        sin_alt = math.sin(math.radians(PRESSURE_ALT_DEG))
+        for i in state.active:
+            if self._cos_cos[i] > 1e-9:
+                cos_h = (sin_alt - self._sin_sin[i]) / self._cos_cos[i]
+                if cos_h < 1.0:
+                    reach.setdefault(self._bin_of[i], []).append(math.degrees(math.acos(max(-1.0, cos_h))))
+        self._bin_reach = [(_median(reach[b]) if b in reach else 0.0) for b in range(bins)]
+        self._pressure = [1.0] * bins
         self._band_scale_last = 1.0
         self._band_scale_night = -1
         self._pool_night = -1
@@ -379,6 +409,7 @@ class Planner:
             self.night_index_seen = night_index
             # how much the coming nights can be counted on sets how patiently tonight waits
             # for targets to climb: with the next three nights lost, almost not at all
+            self._update_pressure(now, night_index)
             ahead = self._usable[night_index + 1:night_index + 4]
             self._defer_power = DEFER_POWER * (0.3 + 0.7 * (sum(ahead) / len(ahead) if ahead else 1.0))
 
@@ -1128,6 +1159,7 @@ class Planner:
                     worth = (state.weight[i]*max(state.scoring.program_multipliers.values())*cap
                              - state.best_score[i] if self.incremental_scores else state.weight[i]*(cap-f))
                 seconds = max(180.0, min(longest, cap / k_best))
+                worth *= self._pressure[self._bin_of[i]] ** PRESSURE_GAMMA
                 candidates.append((worth / seconds * (1.0 + 2.0 / nights_left), i))
         if not candidates:
             return None
@@ -1253,6 +1285,83 @@ class Planner:
             self.request_exposures += 1
         return action
 
+    def _update_pressure(self, now, night_index: int) -> None:
+        """Once a night: how oversubscribed is each RA strip from here to the end of the
+        survey? Work = exposure-hours its unfinished targets still need at their best,
+        with the fibres filled as well as they have been so far. Time = the hours the strip
+        stands above PRESSURE_ALT_DEG on the remaining (usable) nights, each hour shared
+        among the strips up at that moment in proportion to their work. Pressure is work
+        over that share: above 1 the strip cannot be finished at the present pace."""
+        state = self.state
+        bins = len(self._pressure)
+        fill = (self.total_assigned / max(1, self.observe_count)) if self.observe_count >= 20 else 0.6 * min(self.grid.n, 16)
+        k_scale = max(0.05, state.prior_scale) * PLAN_FACTOR_SAFETY / state.scoring.f0t0
+        work = [0.0] * bins
+        for i in state.active:
+            f = state.factor[i]
+            if f >= DONE_FACTOR:
+                continue
+            k = state.flux[i] * self._model_best[i] * k_scale
+            if k > 0.0:
+                work[self._bin_of[i]] += min(state.max_exposure, 1.0 / k) * max(0.0, 1.0 - f)
+        work = [w / max(1.0, fill) / 3600.0 for w in work]
+        share = [0.0] * bins
+        centres = [(b + 0.5) * RA_BIN_DEG for b in range(bins)]
+        active_bins = [b for b in range(bins) if work[b] > 0.0 and self._bin_reach[b] > 0.0]
+        for n in range(night_index, len(state.nights)):
+            start, end = state.nights[n]
+            begin = max(start, now)
+            seconds = (end - begin).total_seconds()
+            if seconds <= 0.0:
+                continue
+            lst0 = local_sidereal_deg(begin, state.lon)
+            samples = max(1, int(seconds // 1800.0))
+            dt = seconds / samples / 3600.0 * (self._usable[n] if n > night_index else 1.0)
+            for s in range(samples):
+                lst = lst0 + (s + 0.5) * (seconds / samples) * SIDEREAL_DEG_PER_SECOND
+                up = [b for b in active_bins if abs(wrap180(lst - centres[b])) <= self._bin_reach[b]]
+                total = sum(work[b] for b in up)
+                if total > 0.0:
+                    for b in up:
+                        share[b] += dt / total
+        low, high = PRESSURE_RANGE
+        self._pressure = [1.0 if work[b] <= 0.0 else (high if share[b] <= 0.0 else min(high, max(low, 1.0 / share[b])))
+                          for b in range(bins)]
+        if night_index % 15 == 0:
+            self.log("planner: region pressure " + " ".join(f"{int(b * RA_BIN_DEG)}:{self._pressure[b]:.1f}"
+                                                              for b in range(bins) if work[b] > 0.0))
+
+    def _best_hour_angle_left(self, j: int, ha_now: float, night_index: int, seconds_left: float,
+                              later_nights: bool) -> float:
+        """Smallest |hour angle| (degrees) target j can still be observed at: during the rest
+        of tonight, or -- when later nights can be counted on -- on any night up to its last.
+        From night to night the hour angle a target has at dusk only grows (about a degree a
+        night), so the nights between tomorrow and the last need not be walked: a target
+        that is already west of the meridian at dusk tomorrow will never be better than
+        tomorrow at dusk, unless the survey is long enough for it to come round again; one
+        that is still east of the meridian at dawn gets better until its last night."""
+        turn_left = seconds_left * SIDEREAL_DEG_PER_SECOND
+        if ha_now <= 0.0 <= ha_now + turn_left:
+            return 0.0
+        tonight = min(abs(ha_now), abs(ha_now + turn_left))
+        tomorrow = night_index + 1
+        last = min(self.state.last_night[j], len(self._night_lst0) - 1)
+        if not later_nights or tomorrow > last:
+            return tonight
+        ra = self.state.ra[j]
+        start = wrap180(self._night_lst0[tomorrow] - ra)
+        end = start + self._night_turn[tomorrow]
+        if start <= 0.0 <= end:
+            return 0.0
+        last_start = wrap180(self._night_lst0[last] - ra)
+        last_end = last_start + self._night_turn[last]
+        came_round = last_start < start - 5.0          # passed 180 degrees and wrapped
+        if start > 0.0:                                 # setting at dusk
+            later = start if not came_round else (0.0 if last_end >= 0.0 else min(start, -last_end))
+        else:                                           # still rising at dawn
+            later = 0.0 if (last_end >= 0.0 or came_round) else -last_end
+        return min(tonight, later)
+
     def _joint_search(self, candidates, altaz, visible, moon, lst, seconds_left, fibers, night_index=0):
         """Pick (pointing, fibre assignment, exposure length) together.
 
@@ -1294,12 +1403,23 @@ class Planner:
             f = state.factor[j]
             weight = state.weight[j]
             needs = state.required[j] and f < 0.5
-            if prefix[state.last_night[j] + 1] - usable_before >= DEFER_MIN_NIGHTS - 0.5:
-                best_alt = min(89.0, 90.0 - abs(state.dec[j] - state.lat))
-                best_model = scoring.quality_model(best_alt, 1.0) or 0.0
+            # Wait-for-a-better-moment discount: quality here against the best quality this
+            # target can still reach from now to the end of the survey -- NOT against its
+            # transit. A region that is setting at dusk never comes back to transit: each
+            # night it starts lower than the night before, so measured against transit it
+            # looks "too low, wait" for ever and is abandoned (official card A: the RA
+            # 300-345 strip, a third of the catalogue, was captured at 38-54% and hardly
+            # touched after the first month).
+            later_ok = prefix[state.last_night[j] + 1] - usable_before >= DEFER_MIN_NIGHTS - 0.5
+            best_ha = self._best_hour_angle_left(j, ha, night_index, seconds_left, later_ok)
+            sin_alt = self._sin_sin[j] + self._cos_cos[j] * math.cos(math.radians(best_ha))
+            best_alt = math.degrees(math.asin(max(-1.0, min(1.0, sin_alt))))
+            if best_alt > alt:
+                best_model = scoring.quality_model(min(89.0, best_alt), 1.0) or 0.0
                 here = scoring.quality_model(alt, 1.0) or 0.0
                 if best_model > 0.0:
                     damp *= min(1.0, here / best_model) ** defer_power
+            damp *= self._pressure[self._bin_of[j]] ** PRESSURE_GAMMA
             longest = min(state.max_exposure, up)
             unit_rate = state.flux[j] * model * PLAN_FACTOR_SAFETY / scoring.f0t0
             ceiling_k = unit_rate * self._quality_scale(alt, az)
