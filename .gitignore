@@ -4,3 +4,4 @@ __pycache__/
 run_output/
 *.zip
 agent_trace.jsonl
+.DS_Store
