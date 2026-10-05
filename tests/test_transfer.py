@@ -22,6 +22,7 @@ class TransferTests(unittest.TestCase):
         p.state = SimpleNamespace(factor=[1.], best_score=[1.], misses=[0],
                                   weight=[1.], required=[False], scoring=state().scoring)
         p.incremental_scores = False
+        p._top_multiplier = max(p.state.scoring.program_multipliers.values())   # cached by Planner.__init__
         self.assertEqual(p._value(0), 0.)
         p.incremental_scores = True
         self.assertAlmostEqual(p._value(0), .2)

@@ -12,10 +12,7 @@
   "environment": {
     "PYTHONDONTWRITEBYTECODE": "1",
     "LLM_USER_AGENT": "Gosim-agent2026-v4/0.1 (GOSIM Agentic Observer hackathon agent; Python urllib)",
-    "AGENT_CONDITIONS": "quality",
-    "AGENT_SCORE_GAIN": "1",
-    "LLM_MAX_CALLS": "6",
-    "LLM_TOTAL_BUDGET_SECONDS": "180",
-    "LLM_MAX_RETRIES": "0"
+    "AGENT_CONDITIONS": "off",
+    "AGENT_SCORE_GAIN": "1"
   }
 }

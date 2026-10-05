@@ -237,6 +237,10 @@ class Planner:
         from .weather_adapter import build_conditions
         self.conditions_mode, self.conditions = build_conditions(state)
         self.incremental_scores = os.environ.get('AGENT_SCORE_GAIN', '0') == '1'
+        # looked up for every candidate on every decision: compute it once
+        self._top_multiplier = max(state.scoring.program_multipliers.values(), default=1.2)
+        self._pool_stride = 1                         # >1 only when even the lightest search would overrun the clock
+        self._pool_phase = 0
         self.state = state
         self.log = log
         self.grid = state.fiber_grid
@@ -495,6 +499,17 @@ class Planner:
         if self._pace_planned >= PACE_PROBE and full is not None:
             costs = (full, self._pace_cost[1] or full / 4.0, self._pace_cost[2] or full / 8.0)
             level = next((lv for lv in (0, 1, 2) if costs[lv] * decisions_left <= usable), 2)
+            # Last resort. The levels only thin out the pointing search; scanning the
+            # candidates costs the same at every level and grows with the catalogue. If
+            # even level 2 would overrun, look at only every n-th candidate per decision
+            # (a different n-th each time), so the survey slows down instead of being cut off.
+            stride = 1
+            if level == 2 and usable > 0.0 and costs[2] * decisions_left > usable:
+                stride = min(8, int(costs[2] * decisions_left / usable) + 1)
+            if stride != self._pool_stride:
+                self.log(f"planner: candidate scan stride {stride} ({costs[2] * 1000:.0f} ms per light decision, "
+                         f"{decisions_left:.0f} decisions left, {usable:.0f}s usable)")
+                self._pool_stride = stride
         if level != state.fast_level:
             self.log(f"planner: pace level {level} ({(full or 0) * 1000:.0f} ms per full decision, "
                      f"{decisions_left:.0f} decisions left, {usable:.0f}s usable)")
@@ -1082,7 +1097,7 @@ class Planner:
         damp = 0.6 ** state.misses[i]
         threshold = state.scoring.required_threshold
         if self.incremental_scores:
-            top = max(state.scoring.program_multipliers.values())
+            top = self._top_multiplier
             gain = max(0., state.weight[i]*top - state.best_score[i])
             if state.required[i] and f < threshold:
                 gain += REQUIRED_BONUS
@@ -1130,7 +1145,9 @@ class Planner:
         candidates: list[tuple[float, int]] = []
         best_scale = max(state.scale, state.prior_scale) * PLAN_FACTOR_SAFETY / state.scoring.f0t0
         longest = float(state.max_exposure)
-        for i in self._pool:
+        self._pool_phase += 1
+        scan = self._pool if self._pool_stride <= 1 else self._pool[self._pool_phase % self._pool_stride::self._pool_stride]
+        for i in scan:
             v = self._value(i)
             if v <= 0.0:
                 continue
@@ -1152,11 +1169,11 @@ class Planner:
                 if state.required[i] and f < 0.5:
                     worth = v
                 elif (cap - f <= 0.02 if not self.incremental_scores else
-                      state.weight[i]*max(state.scoring.program_multipliers.values())*cap
+                      state.weight[i]*self._top_multiplier*cap
                       - state.best_score[i] <= .02*state.weight[i]):
                     continue
                 else:
-                    worth = (state.weight[i]*max(state.scoring.program_multipliers.values())*cap
+                    worth = (state.weight[i]*self._top_multiplier*cap
                              - state.best_score[i] if self.incremental_scores else state.weight[i]*(cap-f))
                 seconds = max(180.0, min(longest, cap / k_best))
                 worth *= self._pressure[self._bin_of[i]] ** PRESSURE_GAMMA
