@@ -11,6 +11,9 @@
   "working_directory": ".",
   "environment": {
     "PYTHONDONTWRITEBYTECODE": "1",
-    "LLM_USER_AGENT": "Gosim-agent2026-v4/0.1 (GOSIM Agentic Observer hackathon agent; Python urllib)"
+    "LLM_USER_AGENT": "Gosim-agent2026-v4/0.1 (GOSIM Agentic Observer hackathon agent; Python urllib)",
+    "MERGE501_MODULES": "science_ev",
+    "MERGE502_HORIZON": "1",
+    "MERGE502_MISS_LLM": "1"
   }
 }

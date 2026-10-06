@@ -1,171 +1,119 @@
-# python-agent —— participant-agent-protocol-v4 的示例智能体
+# LLM_agent_v5.0.2_merge
 
-[English README see README.md](README.md)
+在 v5.0.1 的 `science_ev` 基础上加入按方位变化的地形遮挡高度后验，
+与主线、队友版及旧合并版独立。`MERGE502_HORIZON=1` 默认启用，设为 `0`
+可回到 v5.0.1 的决策行为；原有模块配置仍使用 `MERGE501_MODULES`。
 
-这是 GOSIM survey26 黑客松望远镜巡天赛题的一个小型、Codex 风格参考实现。它说
-`participant-agent-protocol-v4`(stdin/stdout 上每行一个 JSON 对象),并按真实的多模块
-项目来组织,而不是单文件脚本,方便你看清每一部分职责所在,按需取用。
+前五个 survey night 仅复用正常科学观测的定位、分配与得分回执，不增加
+校准曝光，也不移动光纤做 offset probe。原先公告方向中低于 50° 的硬排除
+在这五晚改为 0.65 的收益权重，让有价值的普通低空观测能够提供证据。
+临时火箭、雨暴等公告的避让继续生效。
 
-它跑的是一个真正的锚点搜索(anchor-search)规划器:给候选目标排序、逐一尝试把每根
-光纤当作指向中心、用能落在玻璃上的最有价值邻居填满剩下 15 根光纤、按期望速率选曝光
-时长与项目——与本仓库同伴 TypeScript 示例完全同一套算法,两者可以直接对比——再加上
-每晚两次 LLM 建议调用。运行需要一个 API key,见下面的「配置」。读懂它、跑起来,再从
-中挑选对你有用的部分搭自己的策略。
+每 5° 方位扇区分别估计 H∈{0°,1°,…,90°}，包含 H=0 的先验质量。
+正分意味着曝光中至少一段高于 H，因此给高度上界；零分仅在**确认落入
+光纤、同次曝光有其它正分目标且无临时事件公告**时提供遮挡证据。
+没出现在 hits 中的目标不会更新地平线。跨扇区轨迹暂不用于训练，以避免
+把某一方位的遮挡错误归给邻接方向；同一曝光内的光纤按相关证据处理。
 
-## 目录结构
+第六晚起，至少被两个不同夜晚覆盖的扇区参与规划。对每个候选曝光按
+至多 120 秒的等长时间片计算轨迹，并在高度后验上积分可见时长比例。
+这同时影响科学得分增量、达到必需目标阈值的概率及 DARK/BRIGHT/BACKUP
+选择。同扇区所有时间片共享 H，跨扇区按模型的独立后验组合。
+曝光质量仍沿用原规划器的起点 airmass/月光模型乘以可见时长比例；
+并没有读取真实天气或精确的隐藏遮挡边界。
 
-```
-agent.py                 入口:stdin/stdout 主循环,按消息类型分支处理
-agent_core/
-  protocol.py             传输层:逐行读一个 JSON 对象,逐行写一个 JSON 对象
-  state.py                 SurveyState:星表 + 跨决策需要跟踪的一切状态
-  geometry.py              公开天球几何公式:恒星时、地平坐标、16 根光纤网格
-  scoring.py               只用公开评分配置估算 factor/score
-  planner.py               决策逻辑:wait / observe / report / finish
-  llm_client.py             OpenAI 兼容 chat 客户端,默认对接 Kimi Coding Plan
-  memory.py                 可选的、尽力而为的 JSONL 决策轨迹日志(默认关闭)
-  validation.py             协议合法性校验 + 确定性兜底动作
-observer.project.json      平台项目清单(镶像、运行命令、环境变量)
-requirements.txt           无需任何第三方包——只用标准库
-.env.example               复制为 .env,运行前先配好 API key
-pack_agent.py              把本目录打包成可提交的 ZIP
-```
+五晚结束后不追加学习；报告触发的 `state_resync` 会撤销对应历史证据并
+重算后验。未采样或只有一晚证据的方向保留原规则；后续新出现的零分仍触发原有
+局部避让，避免因前五晚覆盖不足而重复尝试同一遮挡区域。若最低可观测高度为
+30°，仅凭正常观测无法区分 0° 与 30° 以下的遮挡，输出区间而非声称
+测出精确地平线。后验和证据计数可在 `AGENT_TRACE_PATH` 的
+`merge502_horizon_posterior` / `merge502_horizon_final` 记录中查看。
 
-## 为什么这样拆模块
+本版完成固定夜间 LLM 建议的八卡回放开关对照：关闭机制（v5.0.1）
+48278.58 分，开启机制 47566.91 分，下降 1.47%；八卡全部完成且规划器错误为零。
+required 缺失 42→40，报告收益 800→700，平均每卡耗时 64.8→220.1 秒。
+这不是正向总分提升，本版保留为独立的地平线机制实验，不覆盖上一版。
+上述开关对照没有调用真实 API，也未在提交平台验证。多数方向只学到上界，
+不能把宽后验区间误称为精确恢复了隐藏地形。
 
-- **protocol.py** —— 把线上协议格式(逐行 JSON、stdout 只给协议用、日志只走 stderr)
-  隔离出来,其余代码完全不用操心这件事。
-- **state.py** —— 智能体当前所知一切的唯一来源:`initialize` 给的星表(按并行数组
-  存储,每个目标一个下标)、按赤纬分带的空间索引(快速查"这附近有什么")、每个
-  目标的 `factor`/`misses`/`attempts`、学到的天空 `scale`(从自己命中反推出的质量
-  样本的中位数——隐藏的仪器/透明度/天空/视宁度项绝不从任何文件读取)、天气通知、
-  故障诊断历史。只在 `initialize` 建一次,每次 `decision_request` 更新一次。还保留
-  一份按曝光动作编号记录的精确 factor 账本,这样 Hard mode 的 `state_resync` 可以
-  精确回答——丢弃失效动作编号区间内的账本条目,再用剩下的重新算出每个目标的最佳
-  factor——而不只是依赖 resync 消息里的 `best_scores`(细节见 `_resync` 的注释)。
-- **geometry.py** —— 来自参赛者指南 Geometry 与 Scoring 小节的公开公式:恒星时、
-  地平坐标转换、光纤网格判定、月光因子。任何智能体都需要这些,且与具体场景
-  数据无关。
-- **scoring.py** —— `initialize.payload.scoring` 中**公开**的部分(`q0`、
-  `flux_zero_point`、`exposure_zero_point_seconds`、`airmass_exponent`、
-  `lunar_model`、`program.{bands,multipliers,mismatch_multiplier}`、`required.*`、
-  `uniformity.*`)转换成 factor/波段/倍数估算。
-- **planner.py** —— 锚点搜索策略:给可见、尚未完成的目标排序(必做且尚未过公开
-  factor 门槛的目标拿到一个大加成;快要落下或剩余夜数不多的目标排名更高);对排
-  名靠前的几个候选,逐一尝试把每根光纤当作指向中心,用能落在玻璃上的最有价值邻居
-  填满其余光纤,保留最好的指向;选能带来最佳期望得分/秒的曝光时长,以及最多目标
-  会匹配上的项目。白天整段 `wait` 过去;公告里出现全天区 rain/storm 就关闸;只有在
-  质量出现持续、无法解释的下降并在多个夜晚得到确认后,才上报可疑的仪器故障。限时
-  观测请求(`active_requests`)在曝光时长搜索里只拿到一次只读的"选边"机会:在与
-  最佳得分/秒速率相差不大的几个候选时长里,优先选能让某个仍需完成的目标越过其
-  `completion_factor_threshold` 的那个——绝不会为此改变指向本身,也不会去追一个本
-  来就不会被曝光覆盖的目标(请求过期本身不扣分,所以这里只是顺手,不是去抢)。
-- **llm_client.py** —— OpenAI 兼容客户端(纯 `urllib`,不依赖任何 SDK),默认对接
-  Kimi Coding Plan 接口,改环境变量即可换成任何其它 OpenAI 兼容 `/chat/completions`
-  接口。
-- **memory.py** —— 可选的、尽力而为的 JSONL 决策轨迹日志(今晚建议、结束汇总),
-  默认关闭。state/planner 真正跨决策携带的记忆(学到的 scale、每个目标的进度、
-  今晚建议、report 冷却)放在 `SurveyState`/`Planner` 自己身上,因为那本就是它们
-  各自该跟踪的状态。
-- **validation.py** —— 发往 stdout 前的最后一道防线:检查协议真正会校验的每一项
-  (数值范围、光纤/目标重复使用、未知字段、连续 report 次数上限),并提供
-  `fallback_action()`——无论智能体处于什么状态,这个回复永远合法。
+## 漏命中 LLM 判别
 
-## LLM 用在哪里
+本次接入 `MERGE502_MISS_LLM=1`，复用原 LLM 客户端，在前五晚每晚首次
+出现缺失 hit 或返回零分时问一次，整局最多五次，每次最多八个目标。
+输入仅包含正常光纤位置、边缘距离、整个曝光的最低高度、同曝光正分对照、
+公开公告、近期自己的回执和当前高度后验。输出为没命中、地形遮挡、
+证据不足三个概率及简短理由；结构异常、超时或预算不足时继续用原规则。
 
-每晚开始时(`Planner._night_advice`)都会问模型两个问题,都经过
-`LLMClient.ask_json`,都回答成 `{avoid_directions, duration_scale}`:
+官方 v4 的地形遮挡不删除 hit，因此 **缺失 hit 永远不能作为高度证据**，
+LLM 也不能覆盖这个约束。已返回零分证明落入光纤；当模型认为遮挡概率
+至少 0.8、漏命中概率不超过 0.05、整个曝光满足公开最低高度、无临时公告、
+轨迹只跨一个扇区，而且该曝光没有已有正分对照时，才加入最多普通曝光
+四分之一强度的弱证据。模型概率未做校准；有正分对照的零分沿用原后验
+更新，以避免重复计数。弱证据同样受前五晚窗口及 resync 撤销约束。
 
-1. **预报调用**——读取今晚的预报通知加当前公告,请模型给出要避让的方向和曝光
-   时长系数。
-2. **公告+命中率调用**——把今晚的公告转成一段文字,配上智能体本局至今的命中率,
-   从这个角度再问一遍同样的问题。
+判别与每晚策略共享调用数、500 秒默认总预算和卡片时间，不重试，剩余
+墙钟不足 120 秒时跳过。短判别对官方 DeepSeek 使用非思考模式、至少
+3072 token、最多 15 秒；Kimi Coding 的 k3/k3-256k/kimi-for-coding 使用
+低思考强度、至少 4096 token、最多 25 秒，仍遵守用户配置的更短超时。
+其它服务不添加供应商参数。所有临时设置在调用结束后恢复，每晚策略
+请求保持队友原配置。`merge502_miss_llm` 与 `merge502_miss_llm_final`
+记录判断、协议否决及弱证据数量，不记录密钥。
 
-两份回答会合并:要避让的方向取并集,曝光时长系数取平均。如果某次调用在重试后仍然
-失败,这个问题当晚就不计入合并(如果另一次成功了,仍按那次的结果算);下一晚的调用
-不受影响。目标选择、光纤填充、曝光时长、仪器故障上报的其余逻辑保持完全确定性——
-一局里有约 1,000–5,000 次决策,每次都调模型会直接把钟表时间耗尽,参赛者指南自己也
-写明"不要每次决策都调模型"。还有第三个、不常见的调用,用来在上报可疑仪器故障前
-请模型确认一下(每局最多两次;触发它的规则性证据检查本身就比每晚一次少得多)。
+本地 Kimi 实际 API 判别已返回有效 JSON；真实卡片接入、八卡兼容回放
+和历史成绩分别记录在包外 `experiments/merge_v502/llm_miss_v1`。
+Kimi 实跑 L2 得分 6124.779099，规划器错误为零；40 次总 LLM 调用中
+判别 2 次，共返回 16 个有效目标判断，本次未追加弱地平线证据。
+这是一张卡的接入检查，不能与其它 API 的回放分数作因果提分比较。
+回放不调用该判别，不能用回放成绩声称 LLM 判别提升。补丁前的 v5.0.2
+源码和 ZIP 保存在该目录的 `before/` 与同名 ZIP 中。
 
-### 调用行为
+这是独立的合并提交，基于队友 `Gosim-agent2026-v4`，与 Shiming 主线及 v5.0.0 分开。只使用 Python 标准库，不需要 numpy。
 
-无论模型怎么回,`LLMClient` 都会:
+## 最终默认配置
 
-- 单次调用超时(默认 12 秒),且随钟表时间紧张而收紧(绝不占用生存钟表最后 60
-  秒的预算);
-- 整局 LLM 总耗时预算(默认 300 秒,远低于 900 秒钟表上限);
-- 每局调用次数上限(默认 100);
-- 一个问题最多尝试 3 次,这次没问出答案就先不用,下一次该问的时候照常再问;
-- 捕获任何异常(网络、超时、JSON 解析失败、字段缺失)——失败的尝试不会从
-  `ask_json` 内部抛出来,所有尝试都用完时 `ask_json` 返回 `None`;
-- 绝不设置或改写 HTTP 的 `User-Agent` 头。
+默认 `MERGE501_MODULES=science_ev`：从自己的真实观测得分和公开 resync 更新 `best_score`，在队友联合搜索中用正得分增量替换科学价值项，并按所选目标的预计增量选择最终声明项目。保留原有候选池和 factor 淘汰条件，本轮不增加共同项目搜索维度。
 
-## 配置(.env)
+队友的 24 个联合搜索锚点、时长集、20 秒开销、defer、required 奖励、光纤投影、请求强制曝光、计算预算管理、故障检测与修复处理继续使用。没有加入 v5.0.0 的指向后验、主动校准、完整曝光积分或区间故障检测。
 
-把 `.env.example` 复制为 `.env`,运行前先配好一个 API key:
+`agent.py`、state、geometry、scoring、protocol、validation、memory 与队友逐字节相同。
+llm_client 仅增加两行可选的判别参数合入；原始 planner 完整保存在
+`agent_core/base_planner.py`，新 planner 通过继承接入可选模块。
 
-```
-OPENAI_API_KEY=sk-...
-```
+## v5.0.1 的逐项对照（历史参考）
 
-这样就够了:客户端默认对接
-[Kimi Coding Plan](https://www.kimi.com/code/docs/en/) 接口
-`https://api.kimi.com/coding/v1`,模型用 `k3`。非中国大陆账号应改用
-`https://api.kimi.ai/coding/v1`:
+使用队友此前八卡运行的夜间建议回放，基线及变体均关闭真实 API，故障仲裁统一走队友离线规则。每个变体单独运行一波八卡，避免同时运行多个变体。
 
-```
-OPENAI_BASE_URL=https://api.kimi.ai/coding/v1
-OPENAI_API_KEY=sk-...
+| 配置 | 八卡总分 | 相对回放基线 |
+|---|---:|---:|
+| 队友基线 | 47478.35 | — |
+| 分数增量估值 | **48278.58** | **+1.69%** |
+| 项目波段概率估计 | 47622.89 | +0.30% |
+| 请求未来窗口筛选 | 47478.35 | 0.00% |
+| 增量估值 + 波段估计（缓存后） | 48036.93 | +1.18% |
+
+默认只启用单项表现更好的分数增量估值。缓存前后，该单项八卡分数完全一致，平均每卡回放耗时由约 107 秒降到约 72 秒。组合缓存消除了搜索降级，因此组合分数也发生变化；不能把其缓存前的 48330.05 当成最终版本成绩。
+
+分数增量估值在八卡中五卡提升，三卡下降，required 缺失比回放基线多五个。报告收益仍为八卡合计 800 分。总分提升来自更多科学得分，不能据此声称每卡、每项指标都提升。真实 LLM 和平台结果应单独验证，实验记录存放在包外。
+
+## 运行与实验开关
+
+平台通过 `observer.project.json` 启动 `python3 -u agent.py` 并注入 API 配置。保留队友已可工作的 HTTP 请求形状：默认不设置 temperature，max_tokens 默认 1200、单次超时 25 秒、总 LLM 预算默认 500 秒，且仍受卡片时间上限约束。
+
+本地可设置 `OPENAI_API_KEY` 或 `KIMI_API_KEY`、`OPENAI_BASE_URL`、`OPENAI_MODEL`。设置 `LLM_DISABLED=1` 明确关闭 API；不要把实际密钥文件上传。
+
+- `MERGE501_MODULES=baseline` 并且 `MERGE502_HORIZON=0`：委托队友原始 planner。
+- `MERGE501_MODULES=science_ev`：本版默认。
+- `MERGE502_MISS_LLM=0`：关闭新增 LLM 判别，保留普通回执高度后验。
+- `MERGE501_MODULES=program_calibration`：仅用波段概率选择最终项目，不改变指向和时长。
+- `MERGE501_MODULES=request_filter`：仅增加未来可达窗口筛选，不增加请求奖励权重。
+- 逗号分隔可实验组合，例如 `science_ev,program_calibration`；默认不启用组合。
+
+仓库根目录提供 `run_merge502_all8.py` 和 `run_merge502_compare.py`；说明、测试及对照结果位于 `experiments/merge_v502`。发布 ZIP 由包外 `experiments/merge_v502/pack_release.py` 生成，排除配置文件、模板、结果、日志、回放数据及缓存。
+
+组委会 Kimi 配置的八卡并行命令：
+
+```sh
+python3 run_merge502_all8.py kimi --jobs 8 --env-file gosim-observer-examples/python/.env.example.kimi
 ```
 
-`OPENAI_BASE_URL` / `OPENAI_MODEL` 会覆盖上面的默认值,所以任何其它 OpenAI 兼容的
-`/chat/completions` 接口(OpenAI 本身、本地代理等)改两个变量就能用。key 也可以用
-`KIMI_API_KEY` 这个别名来设。在平台上,`OPENAI_BASE_URL` / `OPENAI_API_KEY` 会被
-自动注入(平台自己的模型代理和一次性临时凭证),提交时完全不需要自己配置,`.env`
-也永远不会被打进提交 ZIP。
-
-没配 API key(`OPENAI_API_KEY` 或 `KIMI_API_KEY`)时,进程会在启动时、读任何 stdin
-之前就检查这一点,然后把错误信息打到 stderr,以非零退出码退出。
-
-本示例调用的是 OpenAI 兼容的 `/chat/completions` 接口。如果你的队伍在工作区的
-**模型 API** 设置里改选了 Anthropic Messages 协议,平台同样会注入
-`ANTHROPIC_BASE_URL` / `ANTHROPIC_API_KEY`(Anthropic SDK 自己的环境变量名);如果你
-自己的智能体改用 Claude 的 Messages API,配上官方 `anthropic` SDK 使用这两个变量即可。
-完整对比见 `docs/model-api-keys.md`。
-
-## 本地运行
-
-本项目只是智能体一侧——不含模拟器/评分器。请用任何支持该协议(stdin/stdout)的
-本地运行器,或平台本身,把 `--agent` 指向本目录的 `agent.py`。完整协议与评分公式
-见 `docs/`。
-
-`agent.py` 在 stdin 上读取 `initialize` / `decision_request` / `finish`,在 stdout 上
-写 `decision_response`;其余内容(日志)全部走 stderr,与协议要求完全一致。
-
-## 打包 / 提交
-
-```bash
-python3 pack_agent.py --out ../python-agent.zip
-```
-
-会把本项目打包,`observer.project.json` 置于 ZIP 根目录
-(`"protocol": "jsonl-v4"`、`run: ["python3", "-u", "agent.py"]`),并跳过 `.env`、
-`__pycache__`、`run_output/`。把 ZIP 作为完整项目上传,或把本目录推到 GitHub 仓库。
-不需要任何第三方包;如果你加了依赖,请同时写进 `requirements.txt` **并**在
-`observer.project.json` 里加一个匹配的 `build` 步骤——否则依赖不会被自动安装。
-
-## 安全属性
-
-- 从不读取任何文件:所有状态都来自 stdin。
-- `agent.py` 里每个分支都包在 `try`/`except` 中;planner 出 bug 只会得到一个安全的
-  `wait`,绝不会崩溃或变成 `agent_error`。
-- `validate_action()` 会在写入 stdout 之前,剥掉一切协议会拒绝的内容。
-- 一次规划调用持续失败,只会让那个问题的答案这一晚不计入合并;其余决策流程
-  (选目标、算曝光、校验)照常运行。
-
-## 许可 / 引用
-
-任务卡、模拟数据、评测代码与本示例项目按 [CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/)
-提供（署名、非商业）；使用请引用 GOSIM 2026 Agentic Observer Hackathon (https://create.gosim.org/survey26/)。选手自己编写的代码不受此限制。
-详见 `LICENSE.md`。
+保持相同 API 配置，加 `--set MERGE502_MISS_LLM=0` 可以做判别开关对照。

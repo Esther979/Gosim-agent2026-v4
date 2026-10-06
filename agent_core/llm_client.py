@@ -122,6 +122,8 @@ class LLMClient:
         }
         if self.temperature is not None:
             payload["temperature"] = self.temperature
+        if getattr(self, '_triage_options', None):
+            payload.update(self._triage_options)
         body = json.dumps(payload).encode("utf-8")
         headers = {"Content-Type": "application/json", "Authorization": "Bearer " + self.api_key}
         if self.user_agent:

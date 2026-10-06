@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Zip this project into a ZIP the platform can prepare and run as a complete project.
 
-    python3 pack_agent.py [--out ../python-agent.zip]
+    python3 pack_agent.py [--out ../LLM_agent_v5.0.2_merge.zip]
 
 Mirrors the platform's project rules (see observer.project.json and the hackathon's
 docs): observer.project.json stays at the zip root with "protocol":
@@ -35,7 +35,7 @@ def collect(root: Path) -> list[Path]:
             continue
         if not path.is_file() or path.name in EXCLUDED_NAMES or path.suffix in EXCLUDED_SUFFIXES:
             continue
-        if path.name == ".env" or (path.name.startswith(".env.") and path.name not in ENV_TEMPLATES):
+        if path.name.startswith(".env"):
             continue
         files.append(path)
     return files
@@ -43,7 +43,7 @@ def collect(root: Path) -> list[Path]:
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--out", type=Path, default=ROOT.parent / "python-agent.zip", help="output zip path")
+    parser.add_argument("--out", type=Path, default=ROOT.parent / "LLM_agent_v5.0.2_merge.zip", help="output zip path")
     args = parser.parse_args(argv)
 
     manifest_path = ROOT / MANIFEST_NAME
