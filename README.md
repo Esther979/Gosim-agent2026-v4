@@ -2,7 +2,9 @@
 
 Team entry by Esther (Jingmeng) and Xinran Wang, built on the organisers' example
 project (`gosimfoundation/hackathon-survey26`, `examples/python-agent`, CC BY-NC 4.0);
-the scheduler, learning models and LLM stages described below are our own work.
+the scheduler, learning models and LLM stages described below are our own work. The
+fast fault probe and the pointing-offset estimate take their ideas from the organisers'
+`python-pro` reference agent (same licence), reimplemented here.
 
 The agent is a joint pointing / fibre / exposure planner that ranks candidate fields
 by expected score per second, learns the things the task card does not state from
@@ -17,14 +19,22 @@ What is learned at run time, from the agent's own hits (never from a file):
 - **terrain**: each announced obstruction is a sector of unknown height and width; a
   grid of hypotheses is weighted by every zero-scoring and scoring hit near it, and
   pointings are valued by the probability that they are clear (`state.Ridge`);
-- **directional weather**: how much a haze / overcast / cold-snap notice over one
-  sector really costs, per notice kind, against the clean sky of the same period;
-- **instrument faults**: a night-by-night censored median of clean quality ratios,
-  corrected for the sky level the program bands reveal, against the typical quiet
-  level, with an earthquake recovery curve;
+- **instrument faults, fast**: a fault is a step down of the instrument alone, so the
+  clean quality ratios of the last three exposures of the night are compared with the
+  six before them; a step to under 55% that is not also a drop of the sky band (which
+  weather would lower and a fault does not) is reported at once with a free report --
+  one per stretch between correct reports, none in the 12 hours after an earthquake
+  notice appears;
+- **instrument faults, slow**: a night-by-night censored median of clean quality
+  ratios, corrected for the sky level the program bands reveal, against the typical
+  quiet level, with an earthquake recovery curve; it catches milder faults and owns
+  the paid reports;
+- **pointing offset** (Hard-mode cards): every assigned target that hit or missed its
+  fibre narrows a grid of candidate offsets; once one explains the outcomes clearly
+  better than none, pointings are commanded so that they land where planned;
 - **pace**: the measured cost of a decision and the engine's own time per decision,
   so the search depth and the optional model calls fit under both the fair clock and
-  the real-time cap.
+  the real-time cap the platform reports (`wallclock.wall_remaining_seconds`).
 
 Switches in `observer.project.json`: `AGENT_SCORE_GAIN=1` values a target by its
 predicted score minus the best it already has; `AGENT_CONDITIONS=off` keeps the

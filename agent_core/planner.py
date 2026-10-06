@@ -128,6 +128,37 @@ FAULT_MAX_FORCED_PER_NIGHT = 4
 # of them produced false reports; a clear-cut drop never reaches the model at all.
 FAULT_MAX_LLM_WAITS = 5
 
+# Fast fault detection, within the night. A fault is a step: the instrument's efficiency
+# drops at one moment (to about a quarter on the cards of 2026-10-06, measured over 300+
+# onsets) and stays down until reported. Weather does not step like that in samples that
+# carry no weather notice. So the clean quality ratios of the last FAST_WINDOW_EXPOSURES
+# exposures are compared with those of the FAST_REF_EXPOSURES exposures before them -- the
+# reference may lie on the previous night, so a fault that began in daytime is a step too.
+# A report costs no time, its answer comes at once, and a false one is free while the
+# allowance lasts (it starts over at every correct report), so a free probe is spent on a
+# clear step without waiting for the night to end -- one per stretch between correct reports,
+# the other free one is left to the nightly detector. Paid reports stay with that detector. The idea follows the organisers' python-pro example (hourly E = quality /
+# band, free probes before paid ones, no probing just after an earthquake notice).
+FAST_WINDOW_EXPOSURES = 3         # the last this many exposures of the night, every one of them low ...
+FAST_MIN_SPAN_HOURS = 0.25        # ... spanning at least this long: unannounced weather dips for a
+                                  # slot or two, a fault is a plateau. No upper limit -- under a fault
+                                  # the learned scale drops and exposures stretch to half an hour.
+FAST_REF_EXPOSURES = 6
+FAST_MIN_SAMPLES = 8              # clean samples needed on each side of the step
+FAST_STEP = 0.55                  # every window exposure below this share of the reference level
+FAST_FLOOR = 0.10                 # a window this far down is the dome shutting part-way, not the instrument
+# Weather lowers the sky, and with it the program band the hits really score in; a fault
+# lowers only the instrument. So when the band checks of the window put the sky clearly
+# below where those of the reference put it, the step is weather and is not probed. This is
+# the organisers' python-pro idea (E = quality level / band level) used as a veto: without
+# enough band checks on both sides the step is probed as before.
+FAST_BAND_VETO = 0.8
+FAST_BAND_MIN_CHECKS = 3
+FAST_RECOVER = 0.85               # after a false probe: re-armed once the level is back to this share
+FAST_MIN_SPACING_HOURS = 0.5
+FAST_QUAKE_HOLD_HOURS = 12.0      # an earthquake lowers efficiency too, in a step, and a report does not repair it
+
+
 FAULT_SYSTEM_PROMPT = (
     "You arbitrate a borderline instrument-fault alarm for a robotic telescope survey. "
     "For each recent night you get: ratio = that night's measured efficiency relative to "
@@ -218,11 +249,12 @@ PACE_PROBE = 40                     # planned decisions run at full depth before
 # engine's own time per decision is measured here as the gap between our answer and the
 # next request, so a scenario the engine simulates slowly (many directional events, many
 # fibres) is noticed, and optional model calls are the first thing dropped to stay inside.
-# The cap is not in the protocol and the platform has already changed it once (3600 s on
-# 2026-10-06 morning, 7200 s the same afternoon), so it is never derived from the fair-clock
-# limit: a cap guessed too low throttles a run that had budget to spare. The smallest cap
-# ever observed is assumed, and the guard may only halve the planning budget, never zero it
-# -- dropping the optional model calls is the first and much cheaper lever.
+# The platform states the real time left under its per-card cap in every request
+# (`wallclock.wall_remaining_seconds`, participant guide); that is used whenever present. Without
+# it the cap is not derived from the fair-clock limit -- the platform changed it once on
+# 2026-10-06 (3600 s -> 7200 s), and a cap guessed too low throttles a run with budget to
+# spare -- but the smallest cap ever observed is assumed. Either way the guard may only halve
+# the planning budget, never zero it: dropping the optional model calls is the cheaper lever.
 REAL_WALL_ASSUMED_CAP = 3600.0
 REAL_WALL_SAFETY = 0.9
 REAL_WALL_MIN_SHARE = 0.5
@@ -343,6 +375,7 @@ class Planner:
         self.reports = 0
         self.correct_reports = 0
         self.false_reports = 0                       # since the last correct report
+        self._fast_false = 0                         # of those, the ones the fast detector made
         self.fault_nights: list[dict] = []           # one record per closed night
         self._fault_floor = 0                        # records before this index no longer count towards a streak
         self._fault_open_night: int | None = None
@@ -357,6 +390,14 @@ class Planner:
         self._report_due: str | None = None
         self._report_streak = 0
         self._awaiting_report_result = False
+        self._fast_pending = False                   # the report in flight came from the fast detector
+        self._fast_block = None                      # level of a step that a fast probe found to be no fault
+        self._fast_ref_level = None
+        self._last_report_hours = float("-inf")
+        self._quake_seen = False                     # an earthquake notice is in the current bulletin
+        self._quake_onset_hours = float("-inf")      # when the current earthquake notice first appeared
+        self.fast_reports = 0
+        self._fast_veto_logged = None
         self._llm_waits = 0
         self._forced_tonight = 0
         self.night_index_seen: int | None = None
@@ -454,7 +495,17 @@ class Planner:
                 self.log(f"planner: observation request {message.get('request_id')} "
                          f"{message.get('status')} (reward {message.get('score_delta', 0.0)})")
         state.on_messages(payload.get("new_messages", []), payload.get("latest_bulletin"))
+        quake_now = any(key.partition("|")[0] == "earthquake" for key in state.notices)
+        if quake_now and not self._quake_seen:
+            self._quake_onset_hours = hours
+        self._quake_seen = quake_now
         state.on_result(payload.get("last_result"), hours)
+        if state.offset_changed:
+            state.offset_changed = False
+            off = state.pointing
+            self.log(f"planner: pointing offset alt {off.offset[0]:+.3f} az {off.offset[1]:+.3f} deg "
+                     f"(explains {off.explained[0]} more fibre outcomes than none, {off.explained[1]} tied cells, "
+                     f"{off.misses} misses so far)")
         if self.conditions is not None:
             self.conditions.update(payload)
         last_result = payload.get("last_result")
@@ -533,7 +584,7 @@ class Planner:
         self.trace.close()
         self.log(f"planner: finished termination_reason={payload.get('termination_reason')} "
                  f"observes={self.observe_count} request_exposures={self.request_exposures} reports={self.reports} "
-                 f"(correct {self.correct_reports}) llm_calls={self.llm.calls_made}")
+                 f"(correct {self.correct_reports}, fast {self.fast_reports}) llm_calls={self.llm.calls_made}")
 
     def note_action(self, action: dict) -> None:
         """Called by agent.py right after an action is validated, so the consecutive-report
@@ -586,10 +637,15 @@ class Planner:
         # Real wall clock: what the engine itself takes per decision, plus what we take, must
         # also fit under the hard cap. When it does not, first the model calls go (see
         # real_slack_allows), then the search depth, through the same `usable` as above.
-        real_cap = REAL_WALL_SAFETY * max(REAL_WALL_ASSUMED_CAP, state.wallclock_limit)
-        real_elapsed = time.monotonic() - self._real_start
         engine_per = _median(self._engine_gaps[-200:]) if len(self._engine_gaps) >= PACE_PROBE else 0.0
-        real_left = real_cap - real_elapsed - decisions_left * engine_per
+        real_elapsed = time.monotonic() - self._real_start
+        if "wall_remaining_seconds" in clock:
+            # the platform states the real time left under its cap (participant guide, wallclock)
+            real_cap = real_elapsed + float(clock["wall_remaining_seconds"])
+            real_left = REAL_WALL_SAFETY * float(clock["wall_remaining_seconds"]) - decisions_left * engine_per
+        else:
+            real_cap = REAL_WALL_SAFETY * max(REAL_WALL_ASSUMED_CAP, state.wallclock_limit)
+            real_left = real_cap - real_elapsed - decisions_left * engine_per
         self._real_slack = real_left - decisions_left * (full or 0.0)
         if real_left < usable:
             if self._real_log_due(real_left):
@@ -860,11 +916,14 @@ class Planner:
                     self._quake_onset[night_id] = float("-inf")
 
     def _fault_mode(self) -> tuple[float, int]:
-        if self.false_reports == 0:
-            return FAULT_BASE
-        if self.false_reports < self.state.false_report_free_allowance:
+        # A false fast probe says the step detector met weather; it says nothing against the
+        # nightly evidence, so only this detector's own false reports raise its bar -- unless
+        # the free allowance is gone, when any false report from now on costs points.
+        if self.false_reports >= self.state.false_report_free_allowance:
+            return FAULT_AFTER_ALLOWANCE
+        if self.false_reports - self._fast_false > 0:
             return FAULT_AFTER_FALSE
-        return FAULT_AFTER_ALLOWANCE
+        return FAULT_BASE
 
     def _quiet_pool_size(self) -> int:
         return sum(1 for r in self.fault_nights if r["level"] is not None and not r["quake"] and r["accepted"])
@@ -963,21 +1022,107 @@ class Planner:
         if night_index is not None and self._fault_open_night is None:
             self._fault_open_night = night_index
             self._forced_tonight = 0
+        if self._report_due is None and night_index is not None and not self._awaiting_report_result:
+            reason = self._fast_fault_check(hours)
+            if reason:
+                self._report_due = reason
+                self._fast_pending = True
+                self.fast_reports += 1
         if self._report_due is None:
             return None
         reason, self._report_due = self._report_due, None
         self.reports += 1
         self._awaiting_report_result = True
+        self._last_report_hours = hours
         self.log(f"planner: reporting instrument fault at {payload.get('now_utc')} ({reason})")
         return {"action": "report", "reason": reason,
                 "decision_source": "rule+llm" if "model agrees" in reason else "rule"}
 
+    def _fast_fault_check(self, hours: float):
+        """A reason string when the clean quality level has stepped down to a plateau low
+        enough to spend a free report on it, else None. See FAST_* above."""
+        state = self.state
+        if self._fast_false > 0 or self.false_reports >= state.false_report_free_allowance:
+            # one free probe per stretch between correct reports: the other free one stays with
+            # the nightly detector, which a wasted allowance would otherwise slow down for days
+            return None
+        if hours - self._last_report_hours < FAST_MIN_SPACING_HOURS:
+            return None
+        if hours - self._quake_onset_hours < FAST_QUAKE_HOLD_HOURS:
+            return None
+        history = state.clean_history
+        if len(history) < 2 * FAST_MIN_SAMPLES:
+            return None
+        # group the clean samples by exposure: the hits of one exposure share its time
+        exposures = []                                 # (when, night, [(ratio, bound)])
+        for when, night, ratio, bound in history[-600:]:
+            if exposures and exposures[-1][0] == when:
+                exposures[-1][2].append((ratio, bound))
+            else:
+                exposures.append((when, night, [(ratio, bound)]))
+        last_when, last_night = exposures[-1][0], exposures[-1][1]
+        split = len(exposures) - FAST_WINDOW_EXPOSURES
+        if split < 1:
+            return None
+        window, before = exposures[split:], exposures[max(0, split - FAST_REF_EXPOSURES):split]
+        if any(e[1] != last_night for e in window) or last_when - window[0][0] < FAST_MIN_SPAN_HOURS:
+            return None
+        window_samples = [x for e in window for x in e[2]]
+        reference = [x for e in before for x in e[2]]
+        if len(window_samples) < FAST_MIN_SAMPLES or len(reference) < FAST_MIN_SAMPLES:
+            return None
+        now_level = _censored_median(window_samples)
+        if self._fast_block is not None:
+            if now_level >= FAST_RECOVER * self._fast_block:
+                self.log(f"planner: fast fault probe re-armed (level {now_level:.2f} back near {self._fast_block:.2f})")
+                self._fast_block = None
+            return None
+        ref_level = _censored_median(reference)
+        if ref_level <= 0.0:
+            return None
+        per_exposure = [_censored_median(e[2]) for e in window]
+        if max(per_exposure) >= FAST_STEP * ref_level or now_level < FAST_FLOOR * ref_level:
+            return None
+        ref_start, ref_end = before[0][0] - 1.0, before[-1][0]
+        sky_now = self._band_level([(p, m, model) for when, p, m, model in state.band_events if ref_end < when <= last_when])
+        sky_ref = self._band_level([(p, m, model) for when, p, m, model in state.band_events if ref_start <= when <= ref_end])
+        if sky_now is not None and sky_ref is not None and sky_now < FAST_BAND_VETO * sky_ref:
+            if self._fast_veto_logged != round(last_when, 2):
+                self._fast_veto_logged = round(last_when, 2)
+                self.log(f"planner: fast fault probe withheld: the sky band fell too ({sky_now:.2f} vs {sky_ref:.2f}), weather")
+            return None
+        self._fast_ref_level = ref_level
+        return (f"fast: clean level {now_level:.2f} for {last_when - window[0][0]:.2f} h over {len(window)} exposures, "
+                f"{now_level / ref_level:.0%} of the {ref_level:.2f} before; free reports left "
+                f"{state.false_report_free_allowance - self.false_reports}")
+
+    def _band_level(self, checks: list):
+        """Sky level (the factor on a target's quality model) that best explains a set of
+        band checks (declared program, scored in it, quality model); the middle of the
+        best-explaining range. None with fewer than FAST_BAND_MIN_CHECKS checks."""
+        if len(checks) < FAST_BAND_MIN_CHECKS:
+            return None
+        band = self.state.scoring.program_band
+        best, values = -1, []
+        for step in range(66):
+            value = 0.30 + 0.02 * step
+            agree = sum(1 for program, matched, model in checks if (band(value * model) == program) == matched)
+            if agree > best:
+                best, values = agree, [value]
+            elif agree == best:
+                values.append(value)
+        return values[len(values) // 2]
+
     def _settle_report(self, correct: bool, payload: dict) -> None:
-        self.log(f"planner: report at {payload.get('now_utc')} was {'correct' if correct else 'FALSE'}")
+        fast, self._fast_pending = self._fast_pending, False
+        self.log(f"planner: report at {payload.get('now_utc')} was {'correct' if correct else 'FALSE'}"
+                 + (" (fast)" if fast else ""))
         self._llm_waits = 0
         if correct:
+            self._fast_block = None
             self.correct_reports += 1
             self.false_reports = 0
+            self._fast_false = 0
             self._quiet_fallback = self._quiet_ref() or self._quake_quiet or self._quiet_fallback
             self.state.forget_quality_history()   # the instrument is repaired: learn the level again
             self.fault_nights = []
@@ -985,6 +1130,12 @@ class Planner:
             self._quake_first = None              # restart the recovery curve on the next judged night
             return
         self.false_reports += 1
+        if fast:
+            self._fast_false += 1
+            # the step was weather or something else a report cannot repair: wait until the
+            # level comes back before probing again; the nightly records are not touched
+            self._fast_block = self._fast_ref_level
+            return
         # The low level was real and not a fault: accept it as the new normal.
         counted = 0
         for record in reversed(self.fault_nights[self._fault_floor:]):
@@ -1905,8 +2056,13 @@ class Planner:
                 state.pending[state.ids[item["i"]]] = PendingPrediction(
                     model=item["model"], band_model=item["model"] / 0.95, alt=item["alt"], az=item["az"],
                     clean=clean and self._direction_factor(item["alt"], item["az"]) >= 1.0,
-                    lst=lst,
+                    lst=lst, fiber=fiber,
                 )
+        # Hard-mode cards: command the pointing that lands on the chosen centre
+        d_alt, d_az = state.pointing.offset
+        cmd_alt = min(90.0, max(0.0, c_alt - d_alt))
+        cmd_az = (c_az - d_az) % 360.0
+        state.pending_cmd = (cmd_alt, cmd_az)
         state.pending_program = program
         state.pending_band_scale = band_scale
         state.pending_duration = duration
@@ -1917,7 +2073,7 @@ class Planner:
 
         return {
             "action": "observe",
-            "pointing": {"alt_deg": c_alt, "az_deg": c_az},
+            "pointing": {"alt_deg": cmd_alt, "az_deg": cmd_az},
             "assignments": assignments,
             "duration_seconds": duration,
             "program": program,

@@ -14,7 +14,7 @@ import math
 from collections import deque
 from typing import NamedTuple, Optional
 
-from .geometry import FiberGrid, max_hour_angle_deg, parse_utc, radec_to_altaz, wrap180
+from .geometry import FiberGrid, max_hour_angle_deg, parse_utc, radec_to_altaz, tangent_offsets, wrap180
 from .scoring import ScoringModel
 
 ALT_MARGIN_DEG = 0.6
@@ -41,6 +41,7 @@ class PendingPrediction(NamedTuple):
     az: float
     clean: bool            # true when no all-sky notice / directional block applied at plan time
     lst: float = float("nan")   # local sidereal time (deg) at the start of the exposure
+    fiber: int = -1               # the fibre the target was assigned to
 
 
 def _mod(a: float, n: float) -> float:
@@ -184,6 +185,75 @@ class Ridge:
         return f"{self.direction} top {t0:.0f}-{t1:.0f} half {h0:.0f}-{h1:.0f} (zero {self.zero_hits} clear {self.clear_hits})"
 
 
+# Hard-mode cards add a fixed, unannounced offset to every pointing (participant guide,
+# appendix A: actual = command + (d_alt, d_az)). Every assigned target is evidence: a hit
+# says the target sat on its fibre's glass under the actual pointing, a miss says it did
+# not. To first order the actual pointing shifts the target's (north, east) position in the
+# field by (-d_alt, -d_az cos(alt)), so a hit allows exactly a rectangle of candidate offsets
+# and a miss everything outside it. The candidates are a grid; each piece of evidence adds
+# to one rectangle of it, so the cost does not grow with the fibre count. The approach
+# follows the organisers' python-pro example, with the scoring made incremental.
+OFFSET_STEP_FRACTION = 1.0 / 16.0   # grid step, as a share of the fibre pitch
+OFFSET_HALF_STEPS = 21              # grid half-width in steps: about 1.3 fibre pitches
+OFFSET_MIN_MISSES = 6               # start estimating after this many assigned-but-missed targets
+OFFSET_REFINE_EVERY = 10            # exposures between estimates
+OFFSET_MARGIN = 8                   # adopt an offset only if it explains this many more outcomes than none
+OFFSET_HITS_PER_EXPOSURE = 16       # all misses are used; hits beyond this many are thinned
+
+
+class PointingOffset:
+    def __init__(self, grid: FiberGrid):
+        self.half_glass = grid.glass / 2.0
+        self.step = grid.pitch * OFFSET_STEP_FRACTION
+        self.n = OFFSET_HALF_STEPS
+        size = 2 * self.n + 1
+        self.score = [[0] * size for _ in range(size)]
+        self.misses = 0
+        self.exposures = 0
+        self.offset = (0.0, 0.0)              # (d_alt, d_az) in degrees: actual = command + offset
+        self.explained = (0, 0)               # (best score - no-offset score, cells tied for best)
+
+    def _span(self, lo: float, hi: float) -> tuple[int, int]:
+        return max(-self.n, math.ceil(lo / self.step)), min(self.n, math.floor(hi / self.step))
+
+    def _add(self, u: float, v: float, k: float, hit: bool) -> None:
+        h = self.half_glass
+        i0, i1 = self._span(u - h, u + h)
+        j0, j1 = self._span((v - h) / k, (v + h) / k)
+        delta = 1 if hit else -1              # a miss is consistent everywhere else: the constant drops out
+        for i in range(i0, i1 + 1):
+            row = self.score[i + self.n]
+            for j in range(j0, j1 + 1):
+                row[j + self.n] += delta
+
+    def note_exposure(self, rows: list) -> bool:
+        """rows: (north - fibre north, east - fibre east, cos(command alt), hit). True when the
+        adopted offset changed."""
+        misses = [r for r in rows if not r[3]]
+        hits = [r for r in rows if r[3]]
+        if len(hits) > OFFSET_HITS_PER_EXPOSURE:
+            stride = len(hits) / OFFSET_HITS_PER_EXPOSURE
+            hits = [hits[int(m * stride)] for m in range(OFFSET_HITS_PER_EXPOSURE)]
+        for row in misses + hits:
+            self._add(*row)
+        self.misses += len(misses)
+        self.exposures += 1
+        if self.misses < OFFSET_MIN_MISSES or self.exposures % OFFSET_REFINE_EVERY:
+            return False
+        best = max(max(row) for row in self.score)
+        zero = self.score[self.n][self.n]
+        if best - zero < OFFSET_MARGIN:
+            return False
+        cells = [(i, j) for i, row in enumerate(self.score) for j, value in enumerate(row) if value == best]
+        d_alt = (sum(i for i, _ in cells) / len(cells) - self.n) * self.step
+        d_az = (sum(j for _, j in cells) / len(cells) - self.n) * self.step
+        self.explained = (best - zero, len(cells))
+        if abs(d_alt - self.offset[0]) + abs(d_az - self.offset[1]) < 0.5 * self.step:
+            return False
+        self.offset = (d_alt, d_az)
+        return True
+
+
 class SurveyState:
     def __init__(self, init_payload: dict):
         site = init_payload["site"]
@@ -257,6 +327,8 @@ class SurveyState:
         self.clean_history: list[tuple[float, int, float, bool]] = []  # (hours, night, ratio, is a lower bound)
         self.pending_night = -1
         self._band_checks: deque = deque(maxlen=600)       # (program, matched, model, night)
+        # the same band checks with their time, kept across repairs: the band is a sky quantity
+        self.band_events: deque = deque(maxlen=3000)       # (hours, program, matched, model)
         self.force_program: Optional[str] = None
         self.pending: dict[str, PendingPrediction] = {}
         self.pending_program = "BACKUP"
@@ -266,6 +338,9 @@ class SurveyState:
         self.notices: set[str] = set()                      # "kind|direction"
         self.terrain: set[str] = set()
         self.ridges: dict[str, Ridge] = {}                 # learned extent of each announced obstruction
+        self.pointing = PointingOffset(self.fiber_grid)    # hidden pointing offset (Hard-mode cards)
+        self.pending_cmd: Optional[tuple[float, float]] = None   # commanded (alt, az) of the observe in flight
+        self.offset_changed = False
         self.duration_scale = 1.0
         self.fast_level = 0
 
@@ -428,6 +503,7 @@ class SurveyState:
             self.pending.clear()
             return
         hits = {h.get("target_id"): float(h.get("score", 0.0)) for h in last_result.get("hits", [])}
+        self._offset_evidence(hits)
         any_positive = any(score > 0 for score in hits.values())
         scoring = self.scoring
         multipliers = scoring.program_multipliers
@@ -466,8 +542,10 @@ class SurveyState:
             if prediction.clean:
                 if abs(multiplier_seen - declared_multiplier) < 2e-4:
                     self._band_checks.append((self.pending_program, True, prediction.model, self.pending_night))
+                    self.band_events.append((hours, self.pending_program, True, prediction.model))
                 elif abs(multiplier_seen - mismatch) < 2e-4:
                     self._band_checks.append((self.pending_program, False, prediction.model, self.pending_night))
+                    self.band_events.append((hours, self.pending_program, False, prediction.model))
             factor_if_match = score / (weight * declared_multiplier) if declared_multiplier > 0 else 0.0
             factor_if_miss = score / (weight * mismatch) if mismatch > 0 else 0.0
             ratio_match = (factor_if_match * f0t0) / (self.flux[i] * self.pending_duration * prediction.model) \
@@ -539,6 +617,25 @@ class SurveyState:
         # attribute the zero to the ridge whose sector the target is nearest to
         ridge = min(self.ridges.values(), key=lambda r: abs(wrap180(az - r.centre)))
         return ridge.note_zero(alt, az, weight)
+
+    def _offset_evidence(self, hits: dict) -> None:
+        if self.pending_cmd is None:
+            return
+        c_alt, c_az = self.pending_cmd
+        k = max(0.05, math.cos(math.radians(c_alt)))
+        rows = []
+        for target_id, prediction in self.pending.items():
+            if prediction.fiber < 0:
+                continue
+            offsets = tangent_offsets(prediction.alt, prediction.az, c_alt, c_az)
+            if offsets is None:
+                continue
+            f_north, f_east = self.fiber_grid.fiber_center(prediction.fiber)
+            rows.append((offsets[0] - f_north, offsets[1] - f_east, k, target_id in hits))
+        if rows and self.pointing.note_exposure(rows):
+            if not self.offset_changed and self.pointing.exposures:
+                self.misses = [0] * len(self.misses)   # the misses were the pointing, not the targets
+            self.offset_changed = True
 
     def terrain_clear_probability(self, alt: float, az: float) -> float:
         """1.0 when no announced ridge can cover (alt, az); 0.0 when one surely does."""

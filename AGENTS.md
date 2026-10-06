@@ -8,7 +8,8 @@ README.zh.md.
 A complete, standard-library-only Python agent for the GOSIM survey26 hackathon's
 telescope-survey challenge. It speaks `participant-agent-protocol-v4` (one JSON
 object per line on stdin/stdout) and runs a joint pointing/fibre/exposure planner
-that learns terrain extent, directional-weather cost, sky scale and instrument faults
+that learns terrain extent, the hidden pointing offset of Hard-mode cards, sky scale and
+instrument faults (a fast within-night step probe plus a slow nightly detector)
 from its own results. A language model reads weekly forecasts and free-text duty-log
 notes into per-night usable estimates and terrain priors, and may veto a borderline
 fault report; every model answer is clamped by rules. Read `agent.py` first -- it is
