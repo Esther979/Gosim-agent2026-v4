@@ -4,6 +4,7 @@ Anchor count, fibre projection, durations, overhead, defer weighting and require
 bonus are retained. Terrain height uncertainty is integrated in science gain.
 """
 import math
+from .spatial_search import FieldSearch
 from .base_planner import (JOINT_DURATIONS, JOINT_OVERHEAD_SECONDS, PLAN_FACTOR_SAFETY,
     DEFER_MIN_NIGHTS, DEFER_POWER, REQUIRED_BONUS, ANCHOR_POOL, JOINT_ANCHORS)
 from .geometry import (lunar_factor, wrap180, SIDEREAL_DEG_PER_SECOND, shift_altaz,
@@ -87,18 +88,23 @@ def joint_search_ev(self, candidates, altaz, visible, moon, lst, seconds_left, f
     half_fov, half_glass, half_side, middle = grid.fov / 2.0, grid.glass / 2.0, grid.side / 2.0, (grid.side - 1) / 2.0
     to_deg = 180.0 / math.pi
     best = None  # (rate, c_alt, c_az, duration index, cells, margins)
+    spatial = FieldSearch(state, grid, altaz, visible, fibers, self.neighbour_radius) \
+        if getattr(state, 'neighbour_search_enabled', False) else None
     for _, anchor in seeds[:n_anchors]:
         a_alt, a_az = altaz(anchor)
-        near = [j for j in state.neighbours(state.ra[anchor], state.dec[anchor], self.neighbour_radius) if j in visible]
-        near_rows = []
-        for j in near:
-            row = gains(j)
-            if max(row) > 0.0:
-                alt, az = altaz(j)
-                alt, az = math.radians(alt), math.radians(az)
-                ca = math.cos(alt)
-                near_rows.append((j, row, ca * math.cos(az), ca * math.sin(az), math.sin(alt),
-                                  self.edge_margin * (1 + 1.5 * state.misses[j])))
+        if spatial is not None:
+            near_rows = spatial.near_rows(anchor, self.edge_margin)
+        else:
+            near = [j for j in state.neighbours(state.ra[anchor], state.dec[anchor], self.neighbour_radius) if j in visible]
+            near_rows = []
+            for j in near:
+                row = gains(j)
+                if max(row) > 0.0:
+                    alt, az = altaz(j)
+                    alt, az = math.radians(alt), math.radians(az)
+                    ca = math.cos(alt)
+                    near_rows.append((j, row, ca * math.cos(az), ca * math.sin(az), math.sin(alt),
+                                      self.edge_margin * (1 + 1.5 * state.misses[j])))
         for fiber in fibers:
             d_north, d_east = grid.fiber_center(fiber)
             c_alt, c_az = shift_altaz(a_alt, a_az, -d_north, -d_east)
@@ -120,7 +126,7 @@ def joint_search_ev(self, candidates, altaz, visible, moon, lst, seconds_left, f
             ex, ey = -s_az, c_az_cos
             for j, row, tx, ty, tz, keep_clear in near_rows:
                 depth = tx * cx + ty * cy + tz * cz
-                if depth <= 0.0:
+                if depth <= 0.0 or (spatial is not None and depth < spatial.cos_radius):
                     continue
                 d_n = to_deg * (tx * nx + ty * ny + tz * nz) / depth
                 d_e = to_deg * (tx * ex + ty * ey) / depth
@@ -131,6 +137,10 @@ def joint_search_ev(self, candidates, altaz, visible, moon, lst, seconds_left, f
                 margin = half_glass - max(abs(d_n - (r_i - middle) * pitch), abs(d_e - (c_i - middle) * pitch))
                 if margin < 0.0:
                     continue
+                if row is None:
+                    row = gains(j)
+                    if max(row) <= 0.0:
+                        continue
                 fib = r_i * side + c_i
                 edge = 1.0 if margin >= keep_clear else 0.4
                 cell = cells.get(fib)

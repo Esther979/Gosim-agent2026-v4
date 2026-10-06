@@ -26,6 +26,7 @@ example target-for-target, so both examples solve the problem the same way.
 from __future__ import annotations
 
 import math
+from .spatial_search import FieldSearch
 from datetime import timedelta
 
 from .geometry import (
@@ -1113,6 +1114,8 @@ class Planner:
                                          night_index, fixed_duration=duration)
         n_anchors = 1 if state.fast_level >= 1 else ANCHORS
         best = None  # (total, c_alt, c_az, chosen)
+        spatial = FieldSearch(state, self.grid, altaz, visible, fibers, self.neighbour_radius) \
+            if getattr(state, 'neighbour_search_enabled', False) else None
         tried = 0
         for _, anchor in anchors:
             if tried >= n_anchors and best is not None:
@@ -1121,8 +1124,11 @@ class Planner:
                 break
             tried += 1
             a_alt, a_az = altaz(anchor)
-            near = [j for j in state.neighbours(state.ra[anchor], state.dec[anchor], self.neighbour_radius) if j in visible]
-            near_values = {j: achievable(j) for j in near}
+            if spatial is not None:
+                near_rows = spatial.near_rows(anchor, self.edge_margin)
+            else:
+                near = [j for j in state.neighbours(state.ra[anchor], state.dec[anchor], self.neighbour_radius) if j in visible]
+                near_values = {j: achievable(j) for j in near}
             for fiber in fibers:
                 d_north, d_east = self.grid.fiber_center(fiber)
                 c_alt, c_az = shift_altaz(a_alt, a_az, -d_north, -d_east)
@@ -1131,9 +1137,12 @@ class Planner:
                 c_alt = round(c_alt, 4)
                 c_az = round(c_az, 4) % 360.0
                 chosen: dict[int, tuple[float, int, float]] = {}  # fiber -> (score, j, margin)
-                for j, v in near_values.items():
-                    if v <= 0.0:
-                        continue
+                point_targets = spatial.targets_in_cap(near_rows, c_alt, c_az) if spatial is not None else near_values
+                for j in point_targets:
+                    if spatial is None:
+                        v = near_values[j]
+                        if v <= 0.0:
+                            continue
                     alt, az = altaz(j)
                     offsets = tangent_offsets(alt, az, c_alt, c_az)
                     if offsets is None:
@@ -1141,6 +1150,10 @@ class Planner:
                     fib, margin = self.grid.classify(*offsets)
                     if fib is None:
                         continue
+                    if spatial is not None:
+                        v = achievable(j)
+                        if v <= 0.0:
+                            continue
                     score = v * (1.0 if margin >= self.edge_margin * (1 + 1.5 * state.misses[j]) else 0.4)
                     existing = chosen.get(fib)
                     if existing is None or score > existing[0]:
@@ -1253,18 +1266,23 @@ class Planner:
         half_fov, half_glass, half_side, middle = grid.fov / 2.0, grid.glass / 2.0, grid.side / 2.0, (grid.side - 1) / 2.0
         to_deg = 180.0 / math.pi
         best = None  # (rate, c_alt, c_az, duration index, cells, margins)
+        spatial = FieldSearch(state, grid, altaz, visible, fibers, self.neighbour_radius) \
+            if getattr(state, 'neighbour_search_enabled', False) else None
         for _, anchor in seeds[:n_anchors]:
             a_alt, a_az = altaz(anchor)
-            near = [j for j in state.neighbours(state.ra[anchor], state.dec[anchor], self.neighbour_radius) if j in visible]
-            near_rows = []
-            for j in near:
-                row = gains(j)
-                if max(row) > 0.0:
-                    alt, az = altaz(j)
-                    alt, az = math.radians(alt), math.radians(az)
-                    ca = math.cos(alt)
-                    near_rows.append((j, row, ca * math.cos(az), ca * math.sin(az), math.sin(alt),
-                                      self.edge_margin * (1 + 1.5 * state.misses[j])))
+            if spatial is not None:
+                near_rows = spatial.near_rows(anchor, self.edge_margin)
+            else:
+                near = [j for j in state.neighbours(state.ra[anchor], state.dec[anchor], self.neighbour_radius) if j in visible]
+                near_rows = []
+                for j in near:
+                    row = gains(j)
+                    if max(row) > 0.0:
+                        alt, az = altaz(j)
+                        alt, az = math.radians(alt), math.radians(az)
+                        ca = math.cos(alt)
+                        near_rows.append((j, row, ca * math.cos(az), ca * math.sin(az), math.sin(alt),
+                                          self.edge_margin * (1 + 1.5 * state.misses[j])))
             for fiber in fibers:
                 d_north, d_east = grid.fiber_center(fiber)
                 c_alt, c_az = shift_altaz(a_alt, a_az, -d_north, -d_east)
@@ -1286,7 +1304,7 @@ class Planner:
                 ex, ey = -s_az, c_az_cos
                 for j, row, tx, ty, tz, keep_clear in near_rows:
                     depth = tx * cx + ty * cy + tz * cz
-                    if depth <= 0.0:
+                    if depth <= 0.0 or (spatial is not None and depth < spatial.cos_radius):
                         continue
                     d_n = to_deg * (tx * nx + ty * ny + tz * nz) / depth
                     d_e = to_deg * (tx * ex + ty * ey) / depth
@@ -1297,6 +1315,10 @@ class Planner:
                     margin = half_glass - max(abs(d_n - (r_i - middle) * pitch), abs(d_e - (c_i - middle) * pitch))
                     if margin < 0.0:
                         continue
+                    if row is None:
+                        row = gains(j)
+                        if max(row) <= 0.0:
+                            continue
                     fib = r_i * side + c_i
                     edge = 1.0 if margin >= keep_clear else 0.4
                     cell = cells.get(fib)

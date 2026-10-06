@@ -43,6 +43,24 @@ class HorizonPosterior:
         self._logs = {}
         self._cdf = {}
         self._nights = {}
+        self.public_terrain = {}
+
+    def set_public_terrain(self, facts):
+        """Validated duty-log measurements are revisable soft priors, not hits."""
+        wanted = dict(facts)
+        if wanted != self.public_terrain:
+            self.public_terrain = wanted
+            self._rebuild()
+
+    def public_fact(self, az):
+        if not self.public_terrain:
+            return None
+        centers = {'N':0., 'NE':45., 'E':90., 'SE':135., 'S':180.,
+                   'SW':225., 'W':270., 'NW':315.}
+        # A compass-only statement supplies no exact obstruction boundary. Use
+        # only its central 45-degree compass bin; retain fallback outside it.
+        return next((r for d,r in self.public_terrain.items()
+                     if abs((az-centers[d]+180)%360-180) <= 22.5), None)
 
     def announce(self, directions):
         changed = set(directions) - self.announced
@@ -57,7 +75,17 @@ class HorizonPosterior:
         near = any(abs((az - centers[d] + 180) % 360 - 180) <= 67.5
                    for d in self.announced if d in centers)
         raised = .6 if near else .15
-        return [1.0 - raised] + [raised / 90.0] * 90
+        prior = [1.0 - raised] + [raised / 90.0] * 90
+        fact = self.public_fact(az)
+        if fact:
+            lo = (0. if fact.get('relation') == 'upper_bound'
+                  else max(0., fact['height_deg']-fact['uncertainty_deg']))
+            hi = min(90., fact['height_deg']+fact['uncertainty_deg'])
+            support = [h for h in HEIGHTS if lo <= h <= hi]
+            confidence = min(.98, fact['confidence'])
+            prior = [(1-confidence)*p + (confidence/len(support) if h in support else 0.)
+                     for h,p in zip(HEIGHTS,prior)]
+        return prior
 
     def add(self, action_index, night_index, samples):
         """samples: (trajectory [(alt, az)], scored_positive).
@@ -130,7 +158,9 @@ class HorizonPosterior:
         self._weights.clear()
         self._cdf.clear()
         self._logs.clear()
-        for b in groups.keys() | soft.keys():
+        public_bins = {b for b in range(N_SECTORS) if self.public_fact((b+.5)*SECTOR_DEG)}
+        for b in groups.keys() | soft.keys() | public_bins:
+            self._logs[b] = [math.log(p) for p in self._prior(b)]
             for labels in groups[b]:
                 self._apply_labels(b, labels)
             for labels in soft[b]:
@@ -166,7 +196,8 @@ class HorizonPosterior:
         self._cdf[b] = cdf
 
     def informed(self, az):
-        return len(self._nights.get(sector(az), ())) >= 2
+        return (bool(self.public_terrain) and self.public_fact(az) is not None
+                or len(self._nights.get(sector(az), ())) >= 2)
 
     def clear_probability(self, alt, az):
         cdf = self._cdf.get(sector(az))
@@ -176,7 +207,7 @@ class HorizonPosterior:
         j = min(90, math.ceil(alt) - 1)
         return cdf[j] if j >= 0 else 0.0
 
-    def visibility_distribution(self, path):
+    def visibility_distribution(self, path, public_only=False):
         """Posterior distribution of clear exposure fraction.
 
         One latent H per 5-degree sector; sector heights are independent in this
@@ -187,7 +218,7 @@ class HorizonPosterior:
         groups = defaultdict(list)
         for alt, az in path:
             b = sector(az)
-            if not self.informed(az):
+            if not self.informed(az) or public_only and self.public_fact(az) is None:
                 groups[None].append(alt)
             else:
                 groups[b].append(alt)
@@ -226,7 +257,8 @@ class HorizonPosterior:
             records = [r for r in self.evidence if r[2] == b]
             soft_records=[r for r in self.soft_evidence if r[2]==b]
             rows.append(dict(azimuth_range_deg=[b * SECTOR_DEG, (b + 1) * SECTOR_DEG],
-                nights=len(self._nights[b]), used=len(self._nights[b]) >= 2,
+                nights=len(self._nights.get(b, ())), used=self.informed((b+.5)*SECTOR_DEG),
+                public_log_prior=self.public_fact((b+.5)*SECTOR_DEG) is not None,
                 evidence_exposures=len(records),
                 positive_hits=sum(clear for r in records for alt,clear in r[3]),
                 controlled_zero_hits=sum(not clear for r in records for alt,clear in r[3]),

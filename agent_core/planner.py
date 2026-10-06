@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import math
 import os
+from datetime import timedelta
 
 from .base_planner import (Planner as TeammatePlanner, REQUEST_MARGIN, PLAN_FACTOR_SAFETY,
                            DIRECTION_AZ, BLOCKING_KINDS, _az_distance)
@@ -17,8 +18,9 @@ from .joint_ev import joint_search_ev
 from .program_calibration import ProgramCalibration, PROGRAMS
 from .request_policy import RequestPolicy
 from .science_value import expected_increment
+from .duty_log import DutyLog
 
-VERSION = "LLM_agent_v5.0.2_merge"
+VERSION = "LLM_agent_v5.1.0_merge"
 MODULES = frozenset({"science_ev", "program_calibration", "request_filter"})
 
 
@@ -42,6 +44,8 @@ class Planner(TeammatePlanner):
         self._horizon_planned = None
         self._horizon_cache = {}
         self._planning_lst = 0.0
+        self.duty_log = DutyLog(state)
+        self._decision_now = state.survey_start
         log(f"planner: {VERSION}; modules={','.join(sorted(self.modules)) or 'baseline'}; teammate fault/search retained")
         log(f"planner: horizon={'first five nights / posterior from night six' if self.horizon else 'disabled'}")
 
@@ -179,14 +183,19 @@ class Planner(TeammatePlanner):
                 maximum_sample_altitude_deg=max(a for a,z in paths[tid]))
         unsafe = any(key.partition('|')[0] not in ('terrain_obstruction', 'earthquake') for key in state.notices)
         self._horizon_pending = (state.pending_action_index, self._horizon_night, paths, unsafe)
+        if any(self.duty_log.overlaps_weather(self._decision_now,
+                self._decision_now+timedelta(seconds=action['duration_seconds']), path[0][1])
+                for path in paths.values() if path):
+            self._horizon_pending = (*self._horizon_pending[:3], True)
         self._miss_geometry=geometry
 
     def _environment_factor(self, alt, az, posterior=True):
         if self.horizon is None:
-            return super()._direction_factor(alt, az)
+            return super()._direction_factor(alt, az) * self.duty_log.priority_factor(self._decision_now, az)
         state = self.state
         warmup = 0 <= self._horizon_night < WARMUP_NIGHTS
-        informed = self._horizon_night >= WARMUP_NIGHTS and self.horizon.informed(az)
+        informed = (bool(self.horizon.public_terrain) and self.horizon.public_fact(az) is not None
+                    or self._horizon_night >= WARMUP_NIGHTS and self.horizon.informed(az))
         factor = 1.0
         for direction in state.terrain:
             if direction in DIRECTION_AZ and alt < 50 and _az_distance(az, DIRECTION_AZ[direction]) <= 60:
@@ -211,19 +220,20 @@ class Planner(TeammatePlanner):
         if informed and posterior:
             probability = self.horizon.clear_probability(alt, az)
             factor *= 1.0 if probability >= .995 else probability
-        return factor
+        return factor * self.duty_log.priority_factor(self._decision_now, az)
 
     def _direction_factor(self, alt, az):
         return self._environment_factor(alt, az)
 
     def _visibility(self, i, duration):
-        if self.horizon is None or self._horizon_night < WARMUP_NIGHTS:
+        if self.horizon is None or self._horizon_night < WARMUP_NIGHTS and not self.horizon.public_terrain:
             return [(1.0, 1.0)]
         key = (i, duration)
         if key not in self._horizon_cache:
             state = self.state
             path = trajectory(state.ra[i], state.dec[i], self._planning_lst, state.lat, duration)
-            self._horizon_cache[key] = self.horizon.visibility_distribution(path)
+            self._horizon_cache[key] = self.horizon.visibility_distribution(path,
+                public_only=self._horizon_night < WARMUP_NIGHTS)
         return self._horizon_cache[key]
 
     def _exposure_gain(self, i, duration, k, model, band_scale, program=None):
@@ -295,6 +305,11 @@ class Planner(TeammatePlanner):
             self.program_calibration.observe(state.pending_program, rows, hours)
 
     def decide(self, payload):
+        self._decision_now = parse_utc(payload['now_utc'])
+        changed = self.duty_log.parse_one(self.llm, payload, self.trace, self.log)
+        if changed and self.horizon is not None:
+            self.horizon.set_public_terrain(self.duty_log.terrain)
+        self.state.duty_log_closed = self.duty_log.closed(self._decision_now)
         if self.horizon is not None:
             self._learn_horizon(payload)
             self._horizon_cache.clear()
@@ -345,6 +360,11 @@ class Planner(TeammatePlanner):
                      fixed_duration=None):
         action = super()._finish_plan(now, lst, c_alt, c_az, chosen, seconds_left, moon, altaz,
                                       hours, night_index, fixed_duration=fixed_duration)
+        if action is not None:
+            end = now+timedelta(seconds=action['duration_seconds'])
+            for tid, prediction in self.state.pending.items():
+                if self.duty_log.overlaps_weather(now, end, prediction.az):
+                    self.state.pending[tid] = prediction._replace(clean=False)
         if action is not None and self.horizon is not None:
             self._horizon_planned = (action, lst)
             for tid in action['assignments'].values():
@@ -380,9 +400,24 @@ class Planner(TeammatePlanner):
     def plan(self, now, *args, **kwargs):
         self._request_now = now
         self._planning_lst = local_sidereal_deg(now, self.state.lon)
+        closure = self.duty_log.next_closure(now)
+        if closure is not None:
+            if args:
+                args = (min(args[0], closure), *args[1:])
+            elif 'night_end' in kwargs:
+                kwargs['night_end'] = min(kwargs['night_end'], closure)
         return super().plan(now, *args, **kwargs)
 
     def on_finish(self, payload):
+        if hasattr(self.state, 'spatial_snapshot'):
+            self.trace.write(dict(event='merge510_spatial_final', **self.state.spatial_snapshot()))
+        if hasattr(self.state, 'required_snapshot'):
+            snapshot = self.state.required_snapshot()
+            self.trace.write(dict(event='merge503_required_final', **snapshot))
+            self.log(f"planner: required guard remaining={snapshot['remaining']} false_completion_updates_prevented={snapshot['false_completion_updates_prevented']}")
+        self.trace.write(dict(event='merge503_duty_final', calls=self.duty_log.calls,
+            valid_replies=self.duty_log.valid_replies, terrain=len(self.duty_log.terrain),
+            weather=len(self.duty_log.weather), spent_seconds=self.duty_log.spent_seconds))
         if self.horizon is not None:
             self.trace.write({'event': 'merge502_horizon_final', **self.horizon.snapshot()})
             self.trace.write(dict(event='merge502_miss_llm_final',calls=self.miss_triage.calls,

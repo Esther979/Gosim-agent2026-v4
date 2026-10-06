@@ -30,7 +30,7 @@ if sys.version_info < (3, 9):
 from agent_core.llm_client import MissingAPIKeyError, require_api_key
 from agent_core.planner import Planner
 from agent_core.protocol import log, read_messages, send_response
-from agent_core.state import SurveyState
+from agent_core.spatial_search import SpatialSurveyState as SurveyState
 from agent_core.validation import ActionRejected, fallback_action, validate_action
 
 
