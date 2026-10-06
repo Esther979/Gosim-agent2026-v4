@@ -7,46 +7,13 @@ README.zh.md.
 
 A complete, standard-library-only Python agent for the GOSIM survey26 hackathon's
 telescope-survey challenge. It speaks `participant-agent-protocol-v4` (one JSON
-object per line on stdin/stdout), runs a joint pointing/fibre/exposure planner. The inherited LLM branch reads weekly
-forecasts into usable-night estimates and arbitrates borderline instrument-fault
-alarms. Optional transferred weather and incremental-score modules are available. Read `agent.py` first -- it is the thin
-stdin/stdout loop that dispatches to everything else.
-
-
-## Local integration branch (2026-10-05)
-
-Based on origin/LLM commit d1d51da58e82e9607a38d0b40b71fd45970dbc59.
-Branch codex/llm-weather-incremental-score publishes the evaluated candidate.
-observer.project.json and .env.example select AGENT_CONDITIONS=quality and
-AGENT_SCORE_GAIN=1, with six LLM attempts, a 180-second budget and no retries.
-The Python fallback defaults still keep the teammate strategy when those variables
-are absent; direct local runs must load the supplied configuration.
-AGENT_CONDITIONS=off and AGENT_SCORE_GAIN=0 restore its numerical policy.
-The spatial-index cache is always active and preserved all four baseline scores.
-
-The runtime files match the package evaluated once as batch 7777491a on online
-cards A-D: mean 29980.755705. The prior LLM_agent_v4_Jingmeng batch averaged
-29782.55358825. LLM budgets differed, and this is not a weather-only ablation.
-See the README comparison for per-card scores, missed required targets and limits.
-
-- conditions.py/reconstruction.py contain frozen, public-input ridge inference;
-  conditions_config.json contains fitted coefficients, never practice truth.
-- weather_adapter.py loads only that model. Quality is evaluated at a representative
-  900-second duration. Sky-band inference and the fault detector remain inherited.
-- state.best_score stores actual received scores. Resync replaces those scores from
-  the public ledger; planning must never write hypothetical credit to real state.
-- The two inherited LLM stages remain intact. Two call sites are not proof that both
-  succeeded in every run; inspect successful replies and applied outputs separately.
-- LLM_DISABLED=1 is a numerical development ablation. Never use hidden card fields
-  as runtime inputs. Offline leave-one-card-out models are supplied by the external
-  benchmark harness through AGENT_CONDITIONS_CONFIG.
-- Experiments, labels, source snapshots and logs belong outside this deployable repo,
-  in ../gosim-observer-examples/experiments/teammate_merge/. Preserve negative trials.
-- Keep credentials outside Git and archives. Do not copy the existing local .env.
-
-Run `python3 -B -m unittest discover -s tests -q` and
-`python3 -B -m agent_core.planner` after relevant changes. Inspect full-run scores,
-missed required targets, termination, CPU and fault timing before changing defaults.
+object per line on stdin/stdout) and runs a joint pointing/fibre/exposure planner
+that learns terrain extent, directional-weather cost, sky scale and instrument faults
+from its own results. A language model reads weekly forecasts and free-text duty-log
+notes into per-night usable estimates and terrain priors, and may veto a borderline
+fault report; every model answer is clamped by rules. Read `agent.py` first -- it is
+the thin stdin/stdout loop that dispatches to everything else; `agent_core/planner.py`
+holds the decisions, `agent_core/state.py` the catalogue and the learned models.
 
 ## Module map
 

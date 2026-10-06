@@ -1,61 +1,35 @@
-# python-agent -- an example agent for participant-agent-protocol-v4
+# python-agent -- GOSIM survey26 hackathon, participant-agent-protocol-v4
 
-> Branch `codex/llm-weather-incremental-score`, based on `origin/LLM` at `d1d51da`.
-> The actual inherited LLM stages are weekly forecast interpretation and borderline
-> fault arbitration; the historical nightly-call description below is superseded.
+Team entry by Esther (Jingmeng) and Xinran Wang, built on the organisers' example
+project (`gosimfoundation/hackathon-survey26`, `examples/python-agent`, CC BY-NC 4.0);
+the scheduler, learning models and LLM stages described below are our own work.
 
-The project manifest enables `AGENT_CONDITIONS=quality` and `AGENT_SCORE_GAIN=1`
-to reproduce the evaluated candidate: frozen public-input ridge quality estimates and actual best-score
-increments. It preserves the joint scheduler, sky-band estimator and fault detector.
-The quality proxy uses a representative 900-second duration, not a future rollout.
-Use `LLM_DISABLED=1` for API-free numerical comparisons. Set conditions to `off` and
-score gain to `0` for the original numerical policy. Credentials and training labels
-are not included. Full experiments are stored outside this deployment directory at
-`../gosim-observer-examples/experiments/teammate_merge/`.
+The agent is a joint pointing / fibre / exposure planner that ranks candidate fields
+by expected score per second, learns the things the task card does not state from
+its own results, and asks a language model a few bounded questions per run where the
+inputs are natural language. Everything the model says is clamped by rules before it
+can change a decision; required targets, exposures and fault reports never depend on
+a model answer alone.
 
-Initial four-card numerical means: baseline 6148.92; candidate 6179.60 (+0.50%).
-L3 regressed by about 152 points. These reused practice cards are not blind validation
-or platform scores; consult the complete comparison before changing deployment.
+What is learned at run time, from the agent's own hits (never from a file):
 
+- the sky-quality scale and the program band the sky is really in;
+- **terrain**: each announced obstruction is a sector of unknown height and width; a
+  grid of hypotheses is weighted by every zero-scoring and scoring hit near it, and
+  pointings are valued by the probability that they are clear (`state.Ridge`);
+- **directional weather**: how much a haze / overcast / cold-snap notice over one
+  sector really costs, per notice kind, against the clean sky of the same period;
+- **instrument faults**: a night-by-night censored median of clean quality ratios,
+  corrected for the sky level the program bands reveal, against the typical quiet
+  level, with an earthquake recovery curve;
+- **pace**: the measured cost of a decision and the engine's own time per decision,
+  so the search depth and the optional model calls fit under both the fair clock and
+  the real-time cap.
 
-Completed paired means: numerical all-card fit 6148.92 -> 6179.60 (+0.50%);
-leave-one-card-out weather 6148.92 -> 6126.80 (-0.36%); live Kimi with at most six
-attempts per card 6086.10 -> 6166.91 (+1.33%). The numerical candidate reproduced
-all four scores on rerun. Each live policy/card was run once with independent model
-responses. OOF excludes weather training data, not scheduler development decisions.
-28 automated tests and 16 inherited planner self-checks pass. Fault arbitration is
-conditional; successful execution of both LLM stages on every card is not established.
-Both `observer.project.json` and `.env.example` use the evaluated settings:
-`AGENT_CONDITIONS=quality`, `AGENT_SCORE_GAIN=1`, `LLM_MAX_CALLS=6`,
-`LLM_TOTAL_BUDGET_SECONDS=180`, and `LLM_MAX_RETRIES=0`.
-Direct local runs do not read the project manifest: copy `.env.example` to `.env`
-only if no `.env` exists, or add these five settings to your existing local file.
-Without explicit variables the Python fallback defaults retain the original policy.
-
-The candidate completed one online A-D evaluation, batch
-`7777491a-d1e2-43b7-b594-9359855df716`, with Kimi `k3`:
-
-| Card | LLM_agent_v4_Jingmeng | This candidate | Difference | Required missing, original / candidate | Candidate charged CPU (s) |
-|---|---:|---:|---:|---:|---:|
-| A | 23512.19 | 23602.56 | +90.37 | 1 / 2 | 391.254 |
-| B | 38928.46 | 39174.26 | +245.80 | 0 / 0 | 483.397 |
-| C | 25230.41 | 24919.78 | -310.63 | 0 / 0 | 526.576 |
-| D | 31459.16 | 32226.43 | +767.28 | 2 / 3 | 252.561 |
-| Mean | 29782.55 | 29980.76 | +198.20 (+0.67%) | | |
-
-All candidate cards ended with `survey_complete`; 22 of 24 time-limited requests
-completed, the same count as the comparison. The comparison batch is
-`a7f11a22-8c42-4117-9d57-a7aadbdbe5a5`; scenario hashes match per card.
-This is one run per version, with different LLM budgets (24 attempts here versus
-87 in the comparison), so the difference cannot be attributed to weather alone.
-Both LLM stages produced usable answers on B; only the forecast stage did on A/C/D.
-The six-call cap can leave no quota for late fault arbitration. No formal guarantee
-of per-card two-stage success or generalization is implied.
-
-Runtime files match the evaluated archive with SHA256
-`30572035a209c48b5ed4d231d33b3432ac6cb57ca624833e136050d9fcc8fc43`.
-Documentation and configuration templates were subsequently updated for this branch.
-
+Switches in `observer.project.json`: `AGENT_SCORE_GAIN=1` values a target by its
+predicted score minus the best it already has; `AGENT_CONDITIONS=off` keeps the
+learned sky scale (the fitted weather model it can swap in lost in leave-one-card-out
+validation). `LLM_DISABLED=1` gives a deterministic, model-free run for comparisons.
 
 [中文说明见 README.zh.md](README.zh.md)
 
@@ -140,40 +114,43 @@ pack_agent.py              zip this folder into a project ZIP for submission
 
 ## Where the LLM is used
 
-Once at the start of every night (`Planner._night_advice`), two questions go to the
-model, each through `LLMClient.ask_json`, each answered as
-`{avoid_directions, duration_scale}`:
+Every call goes through `LLMClient.ask_json` and is answered as one JSON object that
+the planner sanitises before use. There are two kinds of call, neither on the
+per-decision path:
 
-1. **Forecast call** -- reads tonight's forecast notices plus the current bulletin, and
-   asks for directions to avoid and an exposure-length scale.
-2. **Bulletin + hit-rate call** -- reads tonight's live bulletin as plain text, plus the
-   agent's own hit rate so far this run, and asks the same question from that angle.
+1. **Reading the forecast and the duty log** (`Planner._on_forecast`). When a weekly
+   forecast arrives, the model is asked for the usable fraction of every night it
+   covers (and up to seven nights ahead), given the forecast notices, the fixed-table
+   estimate, and `experience`: what nights under each notice kind were really worth so
+   far in this run. Any long free-text field that arrived in the meantime -- an
+   observation request's `reason`, which on some cards carries informal hand-over
+   notes between observers, in several languages, with code words, simple ciphers and
+   corrections -- is handed over as `duty_log`. From it the model may also return
+   `terrain`: how high an obstruction in some compass direction reaches. Bounds: a
+   night the notes alone call bad is still planned at a quarter of its worth; a
+   terrain height becomes a soft prior that the ridge model's own evidence overrides;
+   a night the model leaves out keeps the rule's value.
+2. **Fault arbitration** (`Planner._arbitrate`). When the rule-based detector reaches
+   its reporting threshold on borderline evidence, the model sees the last nights'
+   ratios, sky levels and notices and may veto the report for one more night (at most
+   five times per alarm). It cannot trigger a report; the strong-evidence path never
+   asks.
 
-The two answers are merged: directions to avoid are unioned, and the duration scale is
-averaged. If a call keeps failing after its retries, that question's answer is left out
-of the merge for the night (the other one still counts if it succeeded); the next
-night's calls are unaffected. Target selection, fibre filling, exposure sizing, and
-instrument-fault reporting are otherwise fully deterministic -- calling a model on every
-one of the ~1,000-5,000 decisions in a run would blow through the wall clock; the
-participant guide's own advice is "do not call a model on every decision." A third,
-occasional call asks the model to confirm a suspected instrument fault before reporting
-one (at most twice per run; the rule-based evidence check that triggers it runs far less
-often than once per night).
+Calls are skipped, and the rule answers, when the model budget, the fair clock or the
+projected real wall clock (engine time included) would not allow them.
 
 ### Call behaviour
 
 `LLMClient` enforces, regardless of what the model does:
 
-- a per-call timeout (default 12 s) that also shrinks as the wall clock runs low (never
-  cuts into the last 60 s of the survey's own budget);
-- a total LLM time budget per run (default 300 s, well under the 900 s wall clock);
-- a call cap per run (default 100);
-- up to 3 attempts for one question before moving on without an answer for it this time;
-  the next scheduled call still goes ahead as normal;
-- every exception (network, timeout, bad JSON, missing fields) is caught -- a failed
-  attempt never raises past `ask_json`, and `ask_json` returns `None` when all attempts
-  for that question are exhausted;
-- the HTTP `User-Agent` header is never set or overridden.
+- a per-call timeout (30 s) that also shrinks as the wall clock runs low (never cuts
+  into the last 60 s of the survey's own budget);
+- a total model time budget per run (500 s, scaled to the card's limit);
+- one attempt per question; every exception (network, timeout, bad JSON, missing
+  fields) is caught and `ask_json` returns `None`, which the planner treats as "no
+  answer, use the rule";
+- the key is read from the environment only and never logged; the HTTP `User-Agent`
+  is the one the manifest sets.
 
 ## Configuration (.env)
 

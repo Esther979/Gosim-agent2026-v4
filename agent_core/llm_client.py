@@ -79,13 +79,21 @@ def require_api_key() -> None:
 
 class LLMClient:
     def __init__(self, log=lambda text: None, call_timeout_seconds: float = 30.0,
-                 total_budget_seconds: float = 500.0, max_calls: int = 100, max_retries: int = 0):
+                 total_budget_seconds: float = 900.0, max_calls: int = 100, max_retries: int = 0):
         self.log = log
         self.disabled = llm_disabled()
         self._disabled_logged = False
         self.base_url = os.environ.get("OPENAI_BASE_URL", "").strip().rstrip("/") or DEFAULT_BASE_URL
         self.api_key = os.environ.get("OPENAI_API_KEY", "").strip() or os.environ.get("KIMI_API_KEY", "").strip()
         self.model = os.environ.get("OPENAI_MODEL", "").strip() or DEFAULT_MODEL
+        # k3 is a reasoning model: left to itself it spends the whole completion budget on
+        # reasoning tokens and returns an empty message (measured: 2821-2966 reasoning tokens,
+        # 72 s, finish_reason=length and no JSON). None of these questions needs a chain of
+        # thought, so reasoning is switched off, which answers them in 4-5 s instead. The
+        # platform proxy substitutes the model, so the parameter may not be understood there:
+        # the first rejection drops it for the rest of the run (see _attempt).
+        self.thinking = os.environ.get("LLM_THINKING", "off").strip().lower() == "on"
+        self._no_thinking_rejected = False
         self.call_timeout_seconds = _env_float("LLM_CALL_TIMEOUT_SECONDS", call_timeout_seconds)
         self.total_budget_seconds = _env_float("LLM_TOTAL_BUDGET_SECONDS", total_budget_seconds)
         self.max_calls = int(_env_float("LLM_MAX_CALLS", max_calls))
@@ -105,32 +113,41 @@ class LLMClient:
     def budget_left_seconds(self) -> float:
         return max(0.0, self.total_budget_seconds - self.spent_seconds)
 
-    def _budget_left(self, wallclock_remaining_seconds: float) -> float:
+    def _budget_left(self, wallclock_remaining_seconds: float, timeout: Optional[float] = None) -> float:
         # Never let a model call eat into the last minute of wall clock, and never
         # exceed this run's own LLM time allowance.
-        return min(self.call_timeout_seconds, self.total_budget_seconds - self.spent_seconds,
+        return min(timeout or self.call_timeout_seconds, self.total_budget_seconds - self.spent_seconds,
                    max(0.0, wallclock_remaining_seconds - 60.0))
 
-    def _attempt(self, system_prompt: str, user_payload: dict, timeout: float) -> dict:
+    def _attempt(self, system_prompt: str, user_payload: dict, timeout: float,
+                 max_tokens: Optional[int] = None) -> dict:
         """One HTTP attempt. Raises on any problem; the caller retries or gives up."""
         payload = {
             "model": self.model,
             "messages": [
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": json.dumps(user_payload)},
+                {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
             ],
-            "max_tokens": self.max_tokens,
+            "max_tokens": max_tokens or self.max_tokens,
         }
         if self.temperature is not None:
             payload["temperature"] = self.temperature
-        body = json.dumps(payload).encode("utf-8")
+        no_thinking = not self.thinking and not self._no_thinking_rejected
+        if no_thinking:
+            payload["reasoning_effort"] = "none"
         headers = {"Content-Type": "application/json", "Authorization": "Bearer " + self.api_key}
         if self.user_agent:
             headers["User-Agent"] = self.user_agent
-        request = urllib.request.Request(self.base_url + "/chat/completions", data=body, method="POST", headers=headers)
-        try:
+
+        def post(body_payload):
+            body = json.dumps(body_payload).encode("utf-8")
+            request = urllib.request.Request(self.base_url + "/chat/completions", data=body,
+                                             method="POST", headers=headers)
             with urllib.request.urlopen(request, timeout=timeout) as response:
-                data = json.loads(response.read().decode("utf-8"))
+                return json.loads(response.read().decode("utf-8"))
+
+        try:
+            data = post(payload)
         except urllib.error.HTTPError as exc:
             # keep the provider's explanation (status + first bytes of the body) in the log;
             # the exception type alone hides e.g. "invalid temperature" or a gateway block
@@ -139,7 +156,15 @@ class LLMClient:
             except Exception:  # noqa: BLE001
                 detail = ""
             self.log(f"llm: HTTP {exc.code}: {detail!r}")
-            raise
+            if no_thinking and exc.code in (400, 404, 422):
+                # this endpoint does not take the parameter: ask again without it, once, and
+                # never send it again in this run
+                self._no_thinking_rejected = True
+                payload.pop("reasoning_effort", None)
+                self.log("llm: endpoint rejected reasoning_effort; retrying without it")
+                data = post(payload)
+            else:
+                raise
         choice = data["choices"][0]
         text = choice["message"]["content"] or ""
         match = _JSON_OBJECT.search(text)
@@ -151,10 +176,14 @@ class LLMClient:
             raise ValueError("model reply was not a JSON object")
         return parsed
 
-    def ask_json(self, system_prompt: str, user_payload: dict, wallclock_remaining_seconds: float) -> Optional[dict]:
+    def ask_json(self, system_prompt: str, user_payload: dict, wallclock_remaining_seconds: float,
+                 timeout: Optional[float] = None, max_tokens: Optional[int] = None) -> Optional[dict]:
         """One planning question, answered as exactly one JSON object. Retries up to
         `max_retries` more times on failure; returns None once the budget/call cap/retries
-        are exhausted, so the caller's rule-based answer can take over for this step."""
+        are exhausted, so the caller's rule-based answer can take over for this step.
+        `timeout` / `max_tokens` override the client defaults for one question that is
+        known to need more room (a reasoning model spends its completion tokens on the
+        reasoning first; a question it has to decode text for needs several thousand)."""
         if self.disabled:
             if not self._disabled_logged:
                 self._disabled_logged = True
@@ -165,14 +194,14 @@ class LLMClient:
             if self.calls_made >= self.max_calls:
                 self.log("llm: call cap reached for this run; using the rule-based path")
                 return None
-            timeout = self._budget_left(wallclock_remaining_seconds)
+            timeout = self._budget_left(wallclock_remaining_seconds, timeout)
             if timeout < 1.5:
                 self.log("llm: LLM time budget exhausted; using the rule-based path")
                 return None
             started = time.monotonic()
             self.calls_made += 1
             try:
-                answer = self._attempt(system_prompt, user_payload, timeout)
+                answer = self._attempt(system_prompt, user_payload, timeout, max_tokens)
                 self.successes += 1
                 if self.successes == 1:
                     self.log(f"llm: first successful reply after {time.monotonic() - started:.1f}s")

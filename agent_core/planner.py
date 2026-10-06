@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import math
 import os
+import time
 from datetime import timedelta
 
 from .geometry import (
@@ -87,6 +88,15 @@ PRESSURE_ALT_DEG = 40.0            # a strip counts as available while it stands
 PRESSURE_GAMMA = 0.5
 PRESSURE_RANGE = (0.5, 2.5)
 CLOSED_KINDS = {"rain", "storm"}
+# A directional weather notice covers a sector whose real extent and strength the notice does
+# not state. One conservative factor for all of them: the truth tables of the public practice
+# cards put the combined effect of such an event (transparency x sky / seeing) between 0.36
+# and 0.55. Learning it per kind from our own hits was tried and reverted -- with all-sky
+# notices on nearly every night the clean control sample comes from the good nights, so the
+# estimate charges the night's weather to the sector and collapses to the floor (0.15 on all
+# three v5 cards of the 10-06 evaluation, which cost about 8000 points of required targets).
+NOTICE_FACTOR = 0.35
+TERRAIN_REQUIRED_FLOOR = 0.25   # of its value, for a required target not yet past the threshold
 BLOCKING_KINDS = {"terrain_obstruction", "rocket_launch"}
 DIRECTION_AZ = {"N": 0.0, "NE": 45.0, "E": 90.0, "SE": 135.0, "S": 180.0,
                 "SW": 225.0, "W": 270.0, "NW": 315.0}
@@ -99,7 +109,10 @@ FAULT_AFTER_FALSE = (0.70, 3)      # after a false report, still inside the free
 FAULT_AFTER_ALLOWANCE = (0.60, 3)  # the next false report would cost points
 FAULT_STRONG = 0.70                # counted nights averaging at or below this: report without asking
 FAULT_MIN_SAMPLES = 8              # a night with fewer clean samples is not judged
-FAULT_REF_NIGHTS = 5
+FAULT_REF_MIN_NIGHTS = 4           # quiet nights needed before a low night counts as suspicious
+FAULT_REF_NIGHTS = 15              # quiet nights behind the reference level: a fault is a drop against what
+                                   # is typical, not against a run of unusually fine nights (five fine nights
+                                   # in a row once pushed the reference up by half and bought two false reports)
 FAULT_DARK_CHECKS_WANTED = 6       # force DARK on a suspicious night until this many DARK band checks exist
 FAULT_SKY_CHECKS_MIN = 6           # fewer band checks than this give no sky estimate for the night
 FAULT_SKY_GRID = [0.5 + 0.025 * k for k in range(41)]   # candidate sky levels, relative to the quiet reference
@@ -199,7 +212,30 @@ def _az_distance(a: float, b: float) -> float:
 
 
 PACE_PROBE = 40                     # planned decisions run at full depth before the pace is set
-LLM_BUDGET_FRACTION = 500.0 / 900.0   # of the card's wall-clock limit; the deterministic part needs far less
+# Besides the fair clock (agent CPU, what `wallclock` in the payload reports), the platform
+# stops a run outright when its REAL duration -- engine time included -- passes a hard cap.
+# The cap is not in the protocol; the one observed is four times the fair-clock limit. The
+# engine's own time per decision is measured here as the gap between our answer and the
+# next request, so a scenario the engine simulates slowly (many directional events, many
+# fibres) is noticed, and optional model calls are the first thing dropped to stay inside.
+# The cap is not in the protocol and the platform has already changed it once (3600 s on
+# 2026-10-06 morning, 7200 s the same afternoon), so it is never derived from the fair-clock
+# limit: a cap guessed too low throttles a run that had budget to spare. The smallest cap
+# ever observed is assumed, and the guard may only halve the planning budget, never zero it
+# -- dropping the optional model calls is the first and much cheaper lever.
+REAL_WALL_ASSUMED_CAP = 3600.0
+REAL_WALL_SAFETY = 0.9
+REAL_WALL_MIN_SHARE = 0.5
+# Of the card's fair-clock limit. The platform does not charge time spent waiting on the
+# model, but until a call has proved that, _pace must hold the budget back out of the
+# planning time (see `reserve`), so a budget as large as the limit leaves no planning time
+# at all: that alone crippled the search on all three v5 cards of the 10-06 evaluation.
+LLM_BUDGET_FRACTION = 500.0 / 900.0
+PACE_MAX_RESERVE_SHARE = 0.4          # of the clock still remaining, whatever the model budget is
+# A forecast question that also carries duty-log notes makes the model decode text first;
+# it needs several thousand reasoning tokens and one to two minutes (72-120+ s measured on k3).
+DUTY_LOG_CALL_TIMEOUT = 150.0
+DUTY_LOG_MAX_TOKENS = 8000
 # The model reads every weekly forecast once (see _on_forecast) and turns it into an
 # expected usable fraction for each night it covers. A share of the budget is kept back for
 # fault arbitration; a forecast that arrives when less than that is left is read by rule.
@@ -208,6 +244,32 @@ OUTLOOK_PACING_SLACK_SECONDS = 45.0  # how far ahead of an even spend over the s
 OUTLOOK_MIN_WALLCLOCK_FRACTION = 150.0 / 900.0
 OUTLOOK_LOST_NIGHT = 0.3            # a night expected to be less usable than this is not counted on
 CLOSING_KINDS = ("rain|ALL", "storm|ALL")   # the only prior the rule has; everything else is learned
+
+# Free text in messages (an observation request's `reason`, say) can carry what the structured
+# records do not: informal hand-over notes between observers. They are read with the next
+# forecast, never in a call of their own. What the model may take from them is bounded:
+# a night it calls bad but no forecast event covers is still planned at DUTY_LOG_MIN_USABLE
+# of its worth, and a ridge height it reads is only a prior the ridge model's own evidence
+# overrides (see state.Ridge.set_prior).
+DUTY_LOG_MIN_CHARS = 60             # shorter strings are labels, not notes
+DUTY_LOG_MAX_CHARS = 1500           # per note handed to the model
+DUTY_LOG_KEEP_FIRST = 2             # earliest notes often define the conventions later ones use
+DUTY_LOG_KEEP_RECENT = 8
+DUTY_LOG_NIGHTS_AHEAD = 7           # nights the notes are asked about beyond the forecast's coverage
+DUTY_LOG_MIN_USABLE = 0.25
+RIDGE_PRIOR_MIN_DEG, RIDGE_PRIOR_MAX_DEG = 10.0, 55.0
+
+DUTY_LOG_PROMPT_ADDENDUM = (
+    "\n`duty_log` holds informal notes passed between the observers on duty, in whatever "
+    "language and style they wrote them; earlier notes may define code words, simple ciphers "
+    "or shorthand that later notes use, so read them in order and decode. A later correction "
+    "supersedes what it corrects. Ignore hearsay the writer doubts and anything about other "
+    "sites. Use them for two things only: (1) nights in `nights` that no forecast event covers "
+    "-- estimate `usable` for them from the notes (1.0 when the notes say nothing about a "
+    "night); (2) `terrain`: if the notes give how high a ridge or obstruction in some compass "
+    "direction reaches, return {\"SE\": altitude_deg, ...} converting zenith distances to "
+    "altitude above the horizon; otherwise {}."
+)
 
 OUTLOOK_SYSTEM_PROMPT = (
     "You plan a robotic telescope survey. A weekly forecast has just arrived: a list of "
@@ -268,6 +330,10 @@ class Planner:
         self._usable_prefix = list(range(len(state.nights) + 1))
         self._forecast_keys: dict = {}                # night index -> {"kind|ALL" or "kind|DIR"} forecast for it
         self._kind_stats: dict = {}                   # key -> [sum of usable fractions actually seen, nights]
+        self._duty_log_first: list[dict] = []        # earliest free-text notes seen (conventions)
+        self._duty_log_recent: list[dict] = []       # notes not yet shown to the model
+        self._duty_log_total = 0
+        self._duty_log_unread = 0                    # notes (first or recent) the model has not seen
         self._night_good: dict = {}                   # night index -> seconds of exposures that returned data
         self._last_observe: tuple | None = None       # (night index, seconds) of the previous action, if an exposure
         self._defer_power = DEFER_POWER
@@ -303,6 +369,10 @@ class Planner:
         self._active_requests: list = []
         self._pace_cost: dict = {0: None, 1: None, 2: None}   # measured seconds per planned decision, per level
         self._pace_samples: dict = {0: [], 1: [], 2: []}
+        self._real_start = time.monotonic()
+        self._real_last_return: float | None = None
+        self._engine_gaps: list[float] = []            # real seconds between our answer and the next request
+        self._real_slack = float("inf")                # projected real seconds to spare under the hard cap
         self._pool: list | None = None                # candidate pool, see plan()
         # quality model of every target at its own transit altitude with no moon: the best
         # its geometry ever allows, used to judge what a target could reach at its best
@@ -333,7 +403,10 @@ class Planner:
         self._pace_prev: tuple | None = None
         self._pace_planned = 0
         self._pace_night_total: float | None = None
-        self._llm_charged = True                      # until a model call shows the engine does not charge for it
+        # The fair clock charges agent CPU, not time spent waiting on the model: measured on
+        # every platform card so far (a1 of the 10-06 evaluation: 791 s waiting, 229 s charged
+        # of 900). The first model call of a run confirms it, and _pace switches if it does not.
+        self._llm_charged = False
         self._last_forced: tuple | None = None        # (request_id, target index) of the previous action, if forced
         self._request_hold_until = float("-inf")      # survey hours: no forced exposure before this
         self._hours_now = 0.0
@@ -348,6 +421,17 @@ class Planner:
     # -- top-level decision ----------------------------------------------------
 
     def decide(self, payload: dict) -> dict:
+        entered = time.monotonic()
+        if self._real_last_return is not None:
+            self._engine_gaps.append(entered - self._real_last_return)
+            if len(self._engine_gaps) > 400:
+                del self._engine_gaps[:200]
+        try:
+            return self._decide(payload)
+        finally:
+            self._real_last_return = time.monotonic()
+
+    def _decide(self, payload: dict) -> dict:
         state = self.state
         now = parse_utc(payload["now_utc"])
         hours = (now - state.survey_start).total_seconds() / 3600.0
@@ -355,6 +439,8 @@ class Planner:
         for message in list(payload.get("new_messages", [])) + [payload.get("latest_bulletin") or {}]:
             if message.get("record_type") == "bulletin" or "slot_id" in message:
                 self._note_bulletin(message)
+        for message in payload.get("new_messages", []):
+            self._collect_duty_log(message)
         for message in payload.get("new_messages", []):
             if message.get("record_type") == "state_resync":
                 self._pool = None                     # invalidated observations bring targets back
@@ -492,10 +578,24 @@ class Planner:
         per_decision_sim = 700.0 if self._pace_planned < PACE_PROBE else \
             max(700.0, (self._pace_night_total - night_seconds) / self._pace_planned)
         decisions_left = max(1.0, night_seconds / per_decision_sim)
-        reserve = 60.0 + (self.llm.budget_left_seconds() if self._llm_charged and not self.llm.disabled else 0.0)
+        held_back = self.llm.budget_left_seconds() if self._llm_charged and not self.llm.disabled else 0.0
+        reserve = 60.0 + min(held_back, PACE_MAX_RESERVE_SHARE * remaining)
         usable = max(0.0, remaining - reserve) * 0.85
         full = self._pace_cost[0]
         level = 0
+        # Real wall clock: what the engine itself takes per decision, plus what we take, must
+        # also fit under the hard cap. When it does not, first the model calls go (see
+        # real_slack_allows), then the search depth, through the same `usable` as above.
+        real_cap = REAL_WALL_SAFETY * max(REAL_WALL_ASSUMED_CAP, state.wallclock_limit)
+        real_elapsed = time.monotonic() - self._real_start
+        engine_per = _median(self._engine_gaps[-200:]) if len(self._engine_gaps) >= PACE_PROBE else 0.0
+        real_left = real_cap - real_elapsed - decisions_left * engine_per
+        self._real_slack = real_left - decisions_left * (full or 0.0)
+        if real_left < usable:
+            if self._real_log_due(real_left):
+                self.log(f"planner: real wall clock {real_elapsed:.0f}s of {real_cap:.0f}s, engine {engine_per * 1000:.0f} ms "
+                         f"per decision, {decisions_left:.0f} decisions left: {max(0.0, real_left):.0f}s usable for planning")
+            usable = max(usable * REAL_WALL_MIN_SHARE, max(0.0, real_left))
         if self._pace_planned >= PACE_PROBE and full is not None:
             costs = (full, self._pace_cost[1] or full / 4.0, self._pace_cost[2] or full / 8.0)
             level = next((lv for lv in (0, 1, 2) if costs[lv] * decisions_left <= usable), 2)
@@ -515,6 +615,23 @@ class Planner:
                      f"{decisions_left:.0f} decisions left, {usable:.0f}s usable)")
             state.fast_level = level
         self._pace_prev = (elapsed, level, False, self.llm.spent_seconds)
+
+    def _terrain_floor(self, i: int) -> float:
+        """How much of a still-unfinished required target's value survives a likely ridge."""
+        state = self.state
+        return TERRAIN_REQUIRED_FLOOR if state.required[i] \
+            and state.factor[i] < state.scoring.required_threshold else 0.0
+
+    def _real_log_due(self, real_left: float) -> bool:
+        bucket = int(max(0.0, real_left) // 100.0)
+        if bucket == getattr(self, "_real_log_bucket", None):
+            return False
+        self._real_log_bucket = bucket
+        return True
+
+    def real_slack_allows(self, seconds: float) -> bool:
+        """Is there room under the real-time hard cap for an optional wait of `seconds`?"""
+        return self._real_slack >= seconds
 
     # -- LLM: reading the weekly forecast -----------------------------------------------
     #
@@ -564,6 +681,36 @@ class Planner:
                 taken += 1
         return result, taken
 
+    def _collect_duty_log(self, message: dict) -> None:
+        """Keep any long free-text field of a message as a note for the model to read with
+        the next forecast. Structured fields are short; a note is not."""
+        for key, value in message.items():
+            if not isinstance(value, str) or len(value) < DUTY_LOG_MIN_CHARS or key in ("record_type", "schema_version"):
+                continue
+            note = {"at": message.get("issued_at_utc"), "field": key, "text": value[:DUTY_LOG_MAX_CHARS]}
+            self._duty_log_total += 1
+            self._duty_log_unread += 1
+            if len(self._duty_log_first) < DUTY_LOG_KEEP_FIRST:
+                self._duty_log_first.append(note)
+            else:
+                self._duty_log_recent.append(note)
+                if len(self._duty_log_recent) > DUTY_LOG_KEEP_RECENT:
+                    del self._duty_log_recent[0]
+            if self._duty_log_total <= 3 or self._duty_log_total % 10 == 0:
+                self.log(f"planner: duty-log note #{self._duty_log_total} ({len(value)} chars in '{key}')")
+
+    def _apply_terrain_prior(self, answer) -> None:
+        terrain = answer.get("terrain") if isinstance(answer, dict) else None
+        if not isinstance(terrain, dict):
+            return
+        for direction, value in terrain.items():
+            ridge = self.state.ridges.get(str(direction).upper())
+            if ridge is None or isinstance(value, bool) or not isinstance(value, (int, float)):
+                continue
+            if RIDGE_PRIOR_MIN_DEG <= float(value) <= RIDGE_PRIOR_MAX_DEG:
+                ridge.set_prior(float(value))
+                self.log(f"planner: terrain prior from duty log {direction} ~{float(value):.0f} deg -> {ridge.summary()}")
+
     def _on_forecast(self, forecast: dict, payload: dict) -> None:
         state = self.state
         try:
@@ -588,33 +735,63 @@ class Planner:
         covered.sort()
         if not covered:
             return
+        notes = self._duty_log_first + self._duty_log_recent if self._duty_log_unread else []
+        from_notes: set[int] = set()
+        if notes:
+            for n in range(covered[0], min(len(state.nights), covered[0] + DUTY_LOG_NIGHTS_AHEAD)):
+                if n not in covered:
+                    covered.append(n)
+                    from_notes.add(n)
+            covered.sort()
         dates = [self._night_dates[n] for n in covered]
         rule = {self._night_dates[n]: round(self._rule_usable(n), 2) for n in covered}
-        eventful = any(self._forecast_keys.get(n) for n in covered)
+        eventful = any(self._forecast_keys.get(n) for n in covered) or bool(notes)
         left = float((payload.get("wallclock") or {}).get("remaining_seconds", 0))
         status, taken, usable = "rule", 0, dict(rule)
         if not eventful:
             status = "quiet"                           # nothing to interpret
         elif self.llm.disabled:
             status = "disabled"
-        elif self.llm.budget_left_seconds() < OUTLOOK_RESERVE_SECONDS + self.llm.call_timeout_seconds \
+        elif self.llm.budget_left_seconds() < OUTLOOK_RESERVE_SECONDS + \
+                (DUTY_LOG_CALL_TIMEOUT if notes else self.llm.call_timeout_seconds) \
                 or left < OUTLOOK_MIN_WALLCLOCK_FRACTION * state.wallclock_limit:
             status = "skipped"
+        elif not self.real_slack_allows(3.0 * (DUTY_LOG_CALL_TIMEOUT if notes else self.llm.call_timeout_seconds)):
+            status = "skipped (real wall clock)"       # the engine is slow on this card: keep the time
         elif self.llm.spent_seconds > OUTLOOK_PACING_SLACK_SECONDS + \
                 (self.llm.total_budget_seconds - OUTLOOK_RESERVE_SECONDS) * (covered[0] + 7) / max(7, len(state.nights)):
             status = "paced"                           # ahead of the budget's pace: keep some for later forecasts
         else:
             experience = {key: {"nights": count, "usable_fraction": round(total / count, 2)}
                           for key, (total, count) in sorted(self._kind_stats.items()) if count}
-            answer = self.llm.ask_json(OUTLOOK_SYSTEM_PROMPT, {
+            request = {
                 "nights": dates,
                 "forecast_notices": forecast.get("notices") or [],
                 "experience": experience,
                 "rule_estimate": rule,
                 "nights_left_in_survey": len(state.nights) - covered[0],
-            }, left)
+            }
+            prompt = OUTLOOK_SYSTEM_PROMPT
+            if notes:
+                request["duty_log"] = notes
+                request["nights_without_forecast_events"] = [self._night_dates[n] for n in covered
+                                                             if not self._forecast_keys.get(n)]
+                prompt += DUTY_LOG_PROMPT_ADDENDUM
+            if notes:
+                answer = self.llm.ask_json(prompt, request, left, timeout=DUTY_LOG_CALL_TIMEOUT,
+                                           max_tokens=DUTY_LOG_MAX_TOKENS)
+            else:
+                answer = self.llm.ask_json(prompt, request, left)
             self.outlook_calls += 1
             usable, taken = self._sanitize_outlook(answer, dates, rule)
+            if notes:
+                for n in from_notes:                   # the notes alone may not write a night off
+                    date = self._night_dates[n]
+                    usable[date] = max(DUTY_LOG_MIN_USABLE, usable[date])
+                if taken:
+                    self._duty_log_recent = []         # read; the earliest notes stay as the key
+                    self._duty_log_unread = 0
+                self._apply_terrain_prior(answer)
             status = "ok" if taken else "fell back"
         for n in covered:
             self._usable[n] = usable[self._night_dates[n]]
@@ -688,6 +865,9 @@ class Planner:
         if self.false_reports < self.state.false_report_free_allowance:
             return FAULT_AFTER_FALSE
         return FAULT_AFTER_ALLOWANCE
+
+    def _quiet_pool_size(self) -> int:
+        return sum(1 for r in self.fault_nights if r["level"] is not None and not r["quake"] and r["accepted"])
 
     def _quiet_ref(self):
         """Median sky-corrected level of the last few quiet (no earthquake) nights that
@@ -852,6 +1032,12 @@ class Planner:
         if record["ref"]:
             record["profile"] = self._night_profile(night_index, record["ref"] * (record["sky"] or 1.0))
         low = record["ratio"] is not None and record["ratio"] <= FAULT_BASE[0]
+        if low and not quake and self.correct_reports == 0 and self._quiet_pool_size() < FAULT_REF_MIN_NIGHTS:
+            # one or two nights are no reference: a single misjudged sky level on either of
+            # them moves it by a third. Such a night is booked as ordinary, not suspected.
+            # (After a repair the healthy level from before the fault stands in instead.)
+            low = False
+            record["ratio"] = None
         record["accepted"] = not low
         if quake and record["level"] is not None and self._quake_quiet and not low:
             loss = 1.0 - record["level"] / self._quake_quiet
@@ -870,6 +1056,9 @@ class Planner:
                  f"c={record['c']} sky={fmt(record['sky'])} ratio={fmt(record['ratio'])}"
                  + (f" recovery={self._quake_recovery:.2f}" if quake else ""))
         self.trace.write({"event": "fault_check", **record, "streak": len(run)})
+        if night_index < 3 or night_index % 10 == 0 or night_index == len(state.nights) - 1:
+            if state.ridges:
+                self.log("planner: terrain " + "; ".join(r.summary() for r in state.ridges.values()))
 
         tier = self._fault_tier(run, mode)
         if not run:
@@ -922,6 +1111,9 @@ class Planner:
         """Borderline alarm: one model call decides between reporting now and waiting one
         more night. Returns "report", "wait_one_night", or None when the call failed (the
         rule then waits for one extra low night)."""
+        if not self.real_slack_allows(self.llm.call_timeout_seconds):
+            self.log("planner: fault arbitration skipped (real wall clock); the rule decides")
+            return None
         rounded = lambda v: None if v is None else round(v, 3)  # noqa: E731
         nights = [{"date": r["date"], "ratio": rounded(r["ratio"]), "c": r["c"], "sky": rounded(r["sky"]),
                    "quake": r["quake"], "notice_kinds": r["kinds"], "profile": r["profile"]}
@@ -964,12 +1156,20 @@ class Planner:
 
     # -- planning value / achievability -----------------------------------------
 
-    def _direction_factor(self, alt: float, az: float) -> float:
+    def _direction_factor(self, alt: float, az: float, terrain_floor: float = 0.0) -> float:
         state = self.state
+        # Terrain: the chance the point is clear of every announced ridge, from what our own
+        # hits have shown so far (state.Ridge). Unknown at first, so low pointings towards a
+        # ridge are tried where they are worth it, and each result tightens the bounds.
+        # `terrain_floor` keeps a target the card insists on in play even where a ridge is
+        # likely: a wrongly learned ridge would otherwise cost 50 points per target with no
+        # way back, while probing one costs a fraction of one exposure.
+        factor = max(state.terrain_clear_probability(alt, az), terrain_floor)
+        if factor <= 0.0:
+            return 0.0
         for direction in state.terrain:
-            if direction in DIRECTION_AZ and alt < 50.0 and _az_distance(az, DIRECTION_AZ[direction]) <= 60.0:
-                return 0.0
-        factor = 1.0
+            if direction not in DIRECTION_AZ and alt < 50.0:
+                return 0.0                    # unknown direction label: stay out low down
         for key in state.notices:
             kind, _, direction = key.partition("|")
             if direction not in DIRECTION_AZ:
@@ -978,7 +1178,7 @@ class Planner:
             if kind in BLOCKING_KINDS and near and alt < 62.0:
                 return 0.0
             if near and alt < 75.0:
-                factor = min(factor, 0.35)
+                factor = min(factor, NOTICE_FACTOR)
         for blocked_az, blocked_alt in state.blocked[-40:]:
             if _az_distance(az, blocked_az) <= 12.0 and alt <= blocked_alt + 3.0:
                 factor = min(factor, 0.2)
@@ -1063,8 +1263,11 @@ class Planner:
             try:
                 deadline = parse_utc(request["deadline_utc"])
                 threshold = float(request["completion_factor_threshold"])
+                reward = float(request.get("completion_reward", 0.0))
             except (KeyError, TypeError, ValueError):
                 continue
+            if reward <= 0.0:
+                continue                              # nothing to gain: the message is only a note
             deadline_left = (deadline - now).total_seconds()
             completed = set(request.get("completed_target_ids") or [])
             now_ok, later = [], 0
@@ -1212,7 +1415,7 @@ class Planner:
             if state.required[i] and f < 0.5 and reach >= 0.5:
                 gain += REQUIRED_BONUS
             damp = (0.6 ** state.misses[i]) * (0.7 ** state.attempts[i])
-            result = gain * damp * self._direction_factor(alt, az)
+            result = gain * damp * self._direction_factor(alt, az, self._terrain_floor(i))
             achievable_cache[i] = result
             return result
 
@@ -1412,7 +1615,8 @@ class Planner:
             if cached is not None:
                 return cached
             alt, az = altaz(j)
-            damp = (0.6 ** state.misses[j]) * (0.7 ** state.attempts[j]) * self._direction_factor(alt, az)
+            damp = (0.6 ** state.misses[j]) * (0.7 ** state.attempts[j]) \
+                * self._direction_factor(alt, az, self._terrain_floor(j))
             model = scoring.quality_model(alt, lunar_factor(moon, state.ra[j], state.dec[j], scoring.lunar_model)) or 0.0
             k = (state.flux[j] * model * self._quality_scale(alt, az) * PLAN_FACTOR_SAFETY) / scoring.f0t0
             ha = wrap180(lst - state.ra[j])
@@ -1701,6 +1905,7 @@ class Planner:
                 state.pending[state.ids[item["i"]]] = PendingPrediction(
                     model=item["model"], band_model=item["model"] / 0.95, alt=item["alt"], az=item["az"],
                     clean=clean and self._direction_factor(item["alt"], item["az"]) >= 1.0,
+                    lst=lst,
                 )
         state.pending_program = program
         state.pending_band_scale = band_scale
