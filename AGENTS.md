@@ -7,10 +7,14 @@ README.zh.md.
 
 A complete, standard-library-only Python agent for the GOSIM survey26 hackathon's
 telescope-survey challenge. It speaks `participant-agent-protocol-v4` (one JSON
-object per line on stdin/stdout), runs a deterministic anchor-search planner, and
-calls an LLM twice per night for forecast/bulletin advice plus occasionally to
-confirm a suspected instrument fault. Read `agent.py` first -- it is the thin
-stdin/stdout loop that dispatches to everything else.
+object per line on stdin/stdout) and runs a joint pointing/fibre/exposure planner
+that learns terrain extent, the hidden pointing offset of Hard-mode cards, sky scale and
+instrument faults (a fast within-night step probe plus a slow nightly detector)
+from its own results. A language model reads weekly forecasts and free-text duty-log
+notes into per-night usable estimates and terrain priors, and may veto a borderline
+fault report; every model answer is clamped by rules. Read `agent.py` first -- it is
+the thin stdin/stdout loop that dispatches to everything else; `agent_core/planner.py`
+holds the decisions, `agent_core/state.py` the catalogue and the learned models.
 
 ## Module map
 
@@ -33,9 +37,9 @@ pack_agent.py              zip this folder into a project ZIP for submission
 ## Changing the strategy
 
 Target ranking, fibre filling and exposure sizing live in `agent_core/planner.py`.
-The two LLM-advised calls (forecast avoidance + bulletin check-in) are issued from
-the night-advice path in `planner.py` through `agent_core/llm_client.py`; the
-instrument-fault confirmation call is a third, rarer call from the same module. You
+The two inherited LLM uses are weekly forecast interpretation (`_on_forecast`) and
+conditional borderline instrument-fault arbitration (`_arbitrate`), both in
+`planner.py` through `agent_core/llm_client.py`. You
 can change the ranking heuristic, add new signals to `SurveyState`, change what (if
 anything) the LLM is asked, or replace the LLM calls entirely with a different
 approach -- the only hard requirement enforced by `validation.py` is that whatever

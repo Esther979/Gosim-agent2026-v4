@@ -1,4 +1,45 @@
-# python-agent -- an example agent for participant-agent-protocol-v4
+# python-agent -- GOSIM survey26 hackathon, participant-agent-protocol-v4
+
+Team entry by Esther (Jingmeng) and Xinran Wang, built on the organisers' example
+project (`gosimfoundation/hackathon-survey26`, `examples/python-agent`, CC BY-NC 4.0);
+the scheduler, learning models and LLM stages described below are our own work. The
+fast fault probe and the pointing-offset estimate take their ideas from the organisers'
+`python-pro` reference agent (same licence), reimplemented here.
+
+The agent is a joint pointing / fibre / exposure planner that ranks candidate fields
+by expected score per second, learns the things the task card does not state from
+its own results, and asks a language model a few bounded questions per run where the
+inputs are natural language. Everything the model says is clamped by rules before it
+can change a decision; required targets, exposures and fault reports never depend on
+a model answer alone.
+
+What is learned at run time, from the agent's own hits (never from a file):
+
+- the sky-quality scale and the program band the sky is really in;
+- **terrain**: each announced obstruction is a sector of unknown height and width; a
+  grid of hypotheses is weighted by every zero-scoring and scoring hit near it, and
+  pointings are valued by the probability that they are clear (`state.Ridge`);
+- **instrument faults, fast**: a fault is a step down of the instrument alone, so the
+  clean quality ratios of the last three exposures of the night are compared with the
+  six before them; a step to under 55% that is not also a drop of the sky band (which
+  weather would lower and a fault does not) is reported at once with a free report --
+  one per stretch between correct reports, none in the 12 hours after an earthquake
+  notice appears;
+- **instrument faults, slow**: a night-by-night censored median of clean quality
+  ratios, corrected for the sky level the program bands reveal, against the typical
+  quiet level, with an earthquake recovery curve; it catches milder faults and owns
+  the paid reports;
+- **pointing offset** (Hard-mode cards): every assigned target that hit or missed its
+  fibre narrows a grid of candidate offsets; once one explains the outcomes clearly
+  better than none, pointings are commanded so that they land where planned;
+- **pace**: the measured cost of a decision and the engine's own time per decision,
+  so the search depth and the optional model calls fit under both the fair clock and
+  the real-time cap the platform reports (`wallclock.wall_remaining_seconds`).
+
+Switches in `observer.project.json`: `AGENT_SCORE_GAIN=1` values a target by its
+predicted score minus the best it already has; `AGENT_CONDITIONS=off` keeps the
+learned sky scale (the fitted weather model it can swap in lost in leave-one-card-out
+validation). `LLM_DISABLED=1` gives a deterministic, model-free run for comparisons.
 
 [中文说明见 README.zh.md](README.zh.md)
 
@@ -83,40 +124,43 @@ pack_agent.py              zip this folder into a project ZIP for submission
 
 ## Where the LLM is used
 
-Once at the start of every night (`Planner._night_advice`), two questions go to the
-model, each through `LLMClient.ask_json`, each answered as
-`{avoid_directions, duration_scale}`:
+Every call goes through `LLMClient.ask_json` and is answered as one JSON object that
+the planner sanitises before use. There are two kinds of call, neither on the
+per-decision path:
 
-1. **Forecast call** -- reads tonight's forecast notices plus the current bulletin, and
-   asks for directions to avoid and an exposure-length scale.
-2. **Bulletin + hit-rate call** -- reads tonight's live bulletin as plain text, plus the
-   agent's own hit rate so far this run, and asks the same question from that angle.
+1. **Reading the forecast and the duty log** (`Planner._on_forecast`). When a weekly
+   forecast arrives, the model is asked for the usable fraction of every night it
+   covers (and up to seven nights ahead), given the forecast notices, the fixed-table
+   estimate, and `experience`: what nights under each notice kind were really worth so
+   far in this run. Any long free-text field that arrived in the meantime -- an
+   observation request's `reason`, which on some cards carries informal hand-over
+   notes between observers, in several languages, with code words, simple ciphers and
+   corrections -- is handed over as `duty_log`. From it the model may also return
+   `terrain`: how high an obstruction in some compass direction reaches. Bounds: a
+   night the notes alone call bad is still planned at a quarter of its worth; a
+   terrain height becomes a soft prior that the ridge model's own evidence overrides;
+   a night the model leaves out keeps the rule's value.
+2. **Fault arbitration** (`Planner._arbitrate`). When the rule-based detector reaches
+   its reporting threshold on borderline evidence, the model sees the last nights'
+   ratios, sky levels and notices and may veto the report for one more night (at most
+   five times per alarm). It cannot trigger a report; the strong-evidence path never
+   asks.
 
-The two answers are merged: directions to avoid are unioned, and the duration scale is
-averaged. If a call keeps failing after its retries, that question's answer is left out
-of the merge for the night (the other one still counts if it succeeded); the next
-night's calls are unaffected. Target selection, fibre filling, exposure sizing, and
-instrument-fault reporting are otherwise fully deterministic -- calling a model on every
-one of the ~1,000-5,000 decisions in a run would blow through the wall clock; the
-participant guide's own advice is "do not call a model on every decision." A third,
-occasional call asks the model to confirm a suspected instrument fault before reporting
-one (at most twice per run; the rule-based evidence check that triggers it runs far less
-often than once per night).
+Calls are skipped, and the rule answers, when the model budget, the fair clock or the
+projected real wall clock (engine time included) would not allow them.
 
 ### Call behaviour
 
 `LLMClient` enforces, regardless of what the model does:
 
-- a per-call timeout (default 12 s) that also shrinks as the wall clock runs low (never
-  cuts into the last 60 s of the survey's own budget);
-- a total LLM time budget per run (default 300 s, well under the 900 s wall clock);
-- a call cap per run (default 100);
-- up to 3 attempts for one question before moving on without an answer for it this time;
-  the next scheduled call still goes ahead as normal;
-- every exception (network, timeout, bad JSON, missing fields) is caught -- a failed
-  attempt never raises past `ask_json`, and `ask_json` returns `None` when all attempts
-  for that question are exhausted;
-- the HTTP `User-Agent` header is never set or overridden.
+- a per-call timeout (30 s) that also shrinks as the wall clock runs low (never cuts
+  into the last 60 s of the survey's own budget);
+- a total model time budget per run (500 s, scaled to the card's limit);
+- one attempt per question; every exception (network, timeout, bad JSON, missing
+  fields) is caught and `ask_json` returns `None`, which the planner treats as "no
+  answer, use the rule";
+- the key is read from the environment only and never logged; the HTTP `User-Agent`
+  is the one the manifest sets.
 
 ## Configuration (.env)
 
